@@ -1,15 +1,23 @@
 package main // Entry point package
 
 import (
-	"log" // Logging library
+	"log" // Logging
 
-	"github.com/iliyamo/cinema-seat-reservation/internal/config" // Internal config loader
-	"github.com/iliyamo/cinema-seat-reservation/internal/router" // Internal router setup
+	"github.com/joho/godotenv" // Load .env (dev/local)
+
+	"github.com/iliyamo/cinema-seat-reservation/internal/config" // Config loader
+	"github.com/iliyamo/cinema-seat-reservation/internal/router" // Router setup
 	"github.com/labstack/echo/v4"                                // Echo web framework
 )
 
 func main() {
-	cfg := config.Load()     // Load environment config
+	// Load .env if present (ignore error in dev/local)
+	if err := godotenv.Load(); err != nil { // Try to load .env
+		log.Println("info: .env not found; using defaults/env") // Non-fatal notice
+	}
+
+	cfg := config.Load() // Load environment config
+
 	e := echo.New()          // Create Echo instance
 	router.RegisterRoutes(e) // Register application routes
 
