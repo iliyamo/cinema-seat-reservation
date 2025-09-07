@@ -55,6 +55,19 @@ func main() {
     // register auth routes with the JWT secret; this adds both public and protected routes
     router.RegisterAuth(e, authH, cfg.JWTSecret)
 
+    // initialise repositories for owner operations.  Cinemas, halls, seats,
+    // shows and show seats each have their own repository to isolate
+    // persistence logic.
+    cr := repository.NewCinemaRepo(db)      // cinema repository
+    hr := repository.NewHallRepo(db)        // hall repository
+    sr := repository.NewSeatRepo(db)        // seat repository
+    shwr := repository.NewShowRepo(db)      // show repository
+    ssr := repository.NewShowSeatRepo(db)   // show seat repository
+    // construct the owner handler with all the repositories
+    ownerH := handler.NewOwnerHandler(cr, hr, sr, shwr, ssr)
+    // register owner routes requiring JWT auth and OWNER role
+    router.RegisterOwner(e, ownerH, cfg.JWTSecret)
+
     addr := ":" + cfg.Port                    // build the address string using the configured port
     log.Printf("listening on %s (env=%s)", addr, cfg.Env) // log where the server is about to start
     log.Fatal(e.Start(addr))                   // start serving HTTP requests and exit if the server returns an error
