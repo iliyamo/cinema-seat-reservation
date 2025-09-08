@@ -242,3 +242,59 @@ func (r *ShowRepo) UpdateByIDAndOwner(ctx context.Context, s *Show, ownerID uint
 	}
 	return ErrNoChange // row exists but values are identical
 }
+
+// DeleteByIDAndOwner removes a show and all of its dependent records provided the
+// show belongs to a hall owned by the given owner. The deletion occurs within
+// a transaction to ensure that no partial cleanup occurs. If the show does
+// not exist, ErrShowNotFound is returned. If it is owned by another user,
+// ErrForbidden is returned. If any reservations exist for the show, the
+// deletion is aborted and ErrConflict is returned.
+func (r *ShowRepo) DeleteByIDAndOwner(ctx context.Context, id, ownerID uint64) error {
+    tx, err := r.db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    // Ensure rollback or commit at the end
+    defer func() {
+        if err != nil {
+            _ = tx.Rollback()
+        } else {
+            _ = tx.Commit()
+        }
+    }()
+    // Verify show exists and belongs to the specified owner
+    var dbOwnerID uint64
+    err = tx.QueryRowContext(ctx,
+        `SELECT h.owner_id FROM shows sh JOIN halls h ON h.id = sh.hall_id WHERE sh.id = ?`, id,
+    ).Scan(&dbOwnerID)
+    if err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            return ErrShowNotFound
+        }
+        return err
+    }
+    if dbOwnerID != ownerID {
+        return ErrForbidden
+    }
+    // Check for existing reservations referencing this show
+    var resCount int
+    if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM reservations WHERE show_id = ?`, id).Scan(&resCount); err != nil {
+        return err
+    }
+    if resCount > 0 {
+        return ErrConflict
+    }
+    // Remove reservation_seats associated with the show (should be none if resCount == 0, but defensive)
+    if _, err = tx.ExecContext(ctx, `DELETE FROM reservation_seats WHERE show_id = ?`, id); err != nil {
+        return err
+    }
+    // Remove show seats entries for the show
+    if _, err = tx.ExecContext(ctx, `DELETE FROM show_seats WHERE show_id = ?`, id); err != nil {
+        return err
+    }
+    // Delete the show itself
+    if _, err = tx.ExecContext(ctx, `DELETE FROM shows WHERE id = ?`, id); err != nil {
+        return err
+    }
+    return nil
+}

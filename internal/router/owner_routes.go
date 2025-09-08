@@ -24,6 +24,7 @@ func RegisterOwner(e *echo.Echo, o *handler.OwnerHandler, jwtSecret string) {
     // g.GET("/cinemas", o.ListCinemas)
     g.PUT("/cinemas/:id", o.UpdateCinema)
     g.PATCH("/cinemas/:id", o.UpdateCinema) // allow partial/semantic updates via PATCH as well
+    g.DELETE("/cinemas/:id", o.DeleteCinema)
 
 	// ---- Halls ----
     g.POST("/halls", o.CreateHall)
@@ -31,6 +32,7 @@ func RegisterOwner(e *echo.Echo, o *handler.OwnerHandler, jwtSecret string) {
     g.PATCH("/halls/:id", o.UpdateHall)
     // NOTE: Listing halls by cinema is provided by the public API (GET /v1/cinemas/:id/halls).
     // g.GET("/cinemas/:cinema_id/halls", o.ListHallsInCinema)
+    g.DELETE("/halls/:id", o.DeleteHall)
 
 	// ---- Seats ----
 	g.POST("/seats", o.CreateSeat)
@@ -45,6 +47,7 @@ func RegisterOwner(e *echo.Echo, o *handler.OwnerHandler, jwtSecret string) {
     g.PATCH("/shows/:id", o.UpdateShow)
     // NOTE: Listing shows in a hall is handled by the public API at /v1/halls/:id/shows.
     // g.GET("/halls/:hall_id/shows", o.ListShowsInHall)
+    g.DELETE("/shows/:id", o.DeleteShow)
 
     // ---- Seats
     g.GET("/halls/:hall_id/seats", o.ListSeatsFlat)          // flat seat list by hall id

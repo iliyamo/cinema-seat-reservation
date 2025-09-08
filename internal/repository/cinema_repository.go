@@ -154,3 +154,85 @@ func (r *CinemaRepo) ListAll(ctx context.Context) ([]*Cinema, error) {
     }
     return out, nil
 }
+
+// DeleteByIDAndOwner removes a cinema and all dependent records (halls, seats,
+// shows, show seats, reservations and reservation seats) provided it belongs
+// to the specified owner. If the cinema does not exist, sql.ErrNoRows is
+// returned. If the cinema exists but is owned by a different user, ErrForbidden
+// is returned. The deletion occurs within a transaction to maintain integrity.
+func (r *CinemaRepo) DeleteByIDAndOwner(ctx context.Context, id, ownerID uint64) error {
+    tx, err := r.db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    defer func() {
+        if err != nil {
+            _ = tx.Rollback()
+        } else {
+            _ = tx.Commit()
+        }
+    }()
+    // Verify cinema exists and ownership
+    var dbOwnerID uint64
+    if err = tx.QueryRowContext(ctx, `SELECT owner_id FROM cinemas WHERE id = ?`, id).Scan(&dbOwnerID); err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            return sql.ErrNoRows
+        }
+        return err
+    }
+    if dbOwnerID != ownerID {
+        return ErrForbidden
+    }
+    // Cascade delete: remove reservation_seats for shows in halls belonging to this cinema
+    if _, err = tx.ExecContext(ctx,
+        `DELETE rs FROM reservation_seats rs
+         JOIN shows sh ON sh.id = rs.show_id
+         JOIN halls h ON h.id = sh.hall_id
+         WHERE h.cinema_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Delete reservations for shows in this cinema's halls
+    if _, err = tx.ExecContext(ctx,
+        `DELETE r FROM reservations r
+         JOIN shows sh ON sh.id = r.show_id
+         JOIN halls h ON h.id = sh.hall_id
+         WHERE h.cinema_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Delete show_seats entries for shows in this cinema's halls
+    if _, err = tx.ExecContext(ctx,
+        `DELETE ss FROM show_seats ss
+         JOIN shows sh ON sh.id = ss.show_id
+         JOIN halls h ON h.id = sh.hall_id
+         WHERE h.cinema_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Delete shows for halls in this cinema
+    if _, err = tx.ExecContext(ctx,
+        `DELETE sh FROM shows sh
+         JOIN halls h ON h.id = sh.hall_id
+         WHERE h.cinema_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Delete seats for halls in this cinema
+    if _, err = tx.ExecContext(ctx,
+        `DELETE s FROM seats s
+         JOIN halls h ON h.id = s.hall_id
+         WHERE h.cinema_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Delete halls for this cinema
+    if _, err = tx.ExecContext(ctx, `DELETE FROM halls WHERE cinema_id = ?`, id); err != nil {
+        return err
+    }
+    // Finally delete the cinema
+    if _, err = tx.ExecContext(ctx, `DELETE FROM cinemas WHERE id = ?`, id); err != nil {
+        return err
+    }
+    return nil
+}

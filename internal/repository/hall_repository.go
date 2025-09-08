@@ -247,3 +247,72 @@ func (r *HallRepo) ExistsExact(
     }
     return true, nil
 }
+
+// DeleteByIDAndOwner removes a hall and all dependent records including seats,
+// shows, show seats, reservations and reservation seats. The hall must belong
+// to the provided owner; otherwise ErrForbidden is returned. If the hall
+// does not exist, sql.ErrNoRows is returned. The deletion is executed within
+// a single transaction to ensure data consistency.
+func (r *HallRepo) DeleteByIDAndOwner(ctx context.Context, id, ownerID uint64) error {
+    tx, err := r.db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    defer func() {
+        if err != nil {
+            _ = tx.Rollback()
+        } else {
+            _ = tx.Commit()
+        }
+    }()
+    // Check hall existence and ownership
+    var dbOwnerID uint64
+    err = tx.QueryRowContext(ctx, `SELECT owner_id FROM halls WHERE id = ?`, id).Scan(&dbOwnerID)
+    if err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            return sql.ErrNoRows
+        }
+        return err
+    }
+    if dbOwnerID != ownerID {
+        return ErrForbidden
+    }
+    // Remove reservation seats for shows in this hall
+    // Delete depends on reservation_seats referencing reservations and shows; we must remove these first.
+    if _, err = tx.ExecContext(ctx,
+        `DELETE rs FROM reservation_seats rs
+         JOIN shows sh ON sh.id = rs.show_id
+         WHERE sh.hall_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Remove reservations for shows in this hall
+    if _, err = tx.ExecContext(ctx,
+        `DELETE r FROM reservations r
+         JOIN shows sh ON sh.id = r.show_id
+         WHERE sh.hall_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Remove show seats for shows in this hall
+    if _, err = tx.ExecContext(ctx,
+        `DELETE ss FROM show_seats ss
+         JOIN shows sh ON sh.id = ss.show_id
+         WHERE sh.hall_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Remove shows in this hall
+    if _, err = tx.ExecContext(ctx, `DELETE FROM shows WHERE hall_id = ?`, id); err != nil {
+        return err
+    }
+    // Remove seats in this hall
+    if _, err = tx.ExecContext(ctx, `DELETE FROM seats WHERE hall_id = ?`, id); err != nil {
+        return err
+    }
+    // Finally delete the hall
+    if _, err = tx.ExecContext(ctx, `DELETE FROM halls WHERE id = ?`, id); err != nil {
+        return err
+    }
+    return nil
+}
