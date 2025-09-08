@@ -16,6 +16,34 @@ import (
     "github.com/iliyamo/cinema-seat-reservation/internal/repository" // repository interfaces
 )
 
+
+
+func parseToISO(ts string) *string {
+    ts = strings.TrimSpace(ts)
+    if ts == "" || ts == "0001-01-01 00:00:00" {
+        return nil
+    }
+    // Try common layouts
+    layouts := []string{
+        time.RFC3339,
+        time.RFC3339Nano,
+        "2006-01-02 15:04:05",           // MySQL DATETIME
+        "2006-01-02 15:04:05 -0700 MST", // Go default String() for time.Time
+        "2006-01-02T15:04:05",           // ISO without zone
+    }
+    for _, layout := range layouts {
+        if t, err := time.Parse(layout, ts); err == nil {
+            iso := t.UTC().Format(time.RFC3339)
+            return &iso
+        }
+        // Try parsing in UTC location for non-zone layouts
+        if t, err := time.ParseInLocation(layout, ts, time.UTC); err == nil {
+            iso := t.UTC().Format(time.RFC3339)
+            return &iso
+        }
+    }
+    return nil
+}
 // PublicHandler aggregates repositories needed for unauthenticated browsing.
 // It produces sanitized responses suitable for public consumption.
 type PublicHandler struct {
@@ -148,20 +176,8 @@ func (h *PublicHandler) GetPublicShowsByHall(c echo.Context) error {
     out := make([]PublicShow, 0, len(shows))
     for _, s := range shows {
         var startPtr, endPtr *string
-        // parse and format start time if present
-        if ts := strings.TrimSpace(s.StartsAt); ts != "" && ts != "0001-01-01 00:00:00" {
-            if t, parseErr := time.Parse("2006-01-02 15:04:05", ts); parseErr == nil {
-                iso := t.UTC().Format(time.RFC3339)
-                startPtr = &iso
-            }
-        }
-        // parse and format end time if present
-        if te := strings.TrimSpace(s.EndsAt); te != "" && te != "0001-01-01 00:00:00" {
-            if et, parseErr := time.Parse("2006-01-02 15:04:05", te); parseErr == nil {
-                iso := et.UTC().Format(time.RFC3339)
-                endPtr = &iso
-            }
-        }
+        startPtr = parseToISO(s.StartsAt)
+        endPtr = parseToISO(s.EndsAt)
         out = append(out, PublicShow{ID: s.ID, Title: s.Title, StartTime: startPtr, EndTime: endPtr})
     }
     return c.JSON(http.StatusOK, echo.Map{"items": out})
@@ -182,20 +198,8 @@ func (h *PublicHandler) GetPublicShow(c echo.Context) error {
         }
         return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
     }
-    // parse start and end times; assign nil pointers if invalid or zero
-    var startPtr, endPtr *string
-    if ts := strings.TrimSpace(s.StartsAt); ts != "" && ts != "0001-01-01 00:00:00" {
-        if t, parseErr := time.Parse("2006-01-02 15:04:05", ts); parseErr == nil {
-            iso := t.UTC().Format(time.RFC3339)
-            startPtr = &iso
-        }
-    }
-    if te := strings.TrimSpace(s.EndsAt); te != "" && te != "0001-01-01 00:00:00" {
-        if et, parseErr := time.Parse("2006-01-02 15:04:05", te); parseErr == nil {
-            iso := et.UTC().Format(time.RFC3339)
-            endPtr = &iso
-        }
-    }
+    startPtr := parseToISO(s.StartsAt)
+    endPtr := parseToISO(s.EndsAt)
     resp := PublicShowDetail{ID: s.ID, Title: s.Title, StartTime: startPtr, EndTime: endPtr}
     // load hall to get hall name and cinema ID
     if hall, err := h.HallRepo.GetByID(ctx, s.HallID); err == nil {
