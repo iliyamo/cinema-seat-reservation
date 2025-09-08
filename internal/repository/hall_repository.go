@@ -23,6 +23,8 @@ type Hall struct {
 
 // ErrHallNotFound is returned when a hall lookup fails.
 var ErrHallNotFound = errors.New("hall not found")
+// ErrHallConflict is returned when another hall with identical attributes exists.
+var ErrHallConflict = errors.New("hall already exists with identical attributes")
 
 // HallRepo provides methods to create and retrieve halls.  It embeds a
 // database handle to perform queries and commands.
@@ -127,17 +129,91 @@ func (r *HallRepo) ListByCinemaAndOwner(ctx context.Context, cinemaID, ownerID u
 // UpdateByIDAndOwner updates hall fields (name/description/seat_rows/seat_cols)
 // if the hall belongs to the given owner.  Returns sql.ErrNoRows when not found.
 func (r *HallRepo) UpdateByIDAndOwner(ctx context.Context, h *Hall) error {
-	const q = `UPDATE halls
+    // Before updating, ensure there is no other hall with identical attributes.
+    ok, err := r.ExistsExact(ctx, h.OwnerID, h.CinemaID, h.Name, h.Description, h.SeatRows, h.SeatCols, &h.ID)
+    if err != nil {
+        return err
+    }
+    if ok {
+        return ErrHallConflict
+    }
+    const q = `UPDATE halls
                SET name = ?, description = ?, seat_rows = ?, seat_cols = ?, updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND owner_id = ?`
-	res, err := r.db.ExecContext(ctx, q,
-		h.Name, h.Description, h.SeatRows, h.SeatCols, h.ID, h.OwnerID,
-	)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+    res, err := r.db.ExecContext(ctx, q,
+        h.Name, h.Description, h.SeatRows, h.SeatCols, h.ID, h.OwnerID,
+    )
+    if err != nil {
+        return err
+    }
+    if n, _ := res.RowsAffected(); n == 0 {
+        return sql.ErrNoRows
+    }
+    return nil
+}
+
+// ExistsExact returns true if a hall already exists for the given owner and cinema
+// with exactly the same name, description, seatRows and seatCols.  The excludeID
+// parameter, when non-nil, excludes that particular hall from the comparison.
+func (r *HallRepo) ExistsExact(
+    ctx context.Context,
+    ownerID uint64,
+    cinemaID *uint64,
+    name string,
+    description sql.NullString,
+    seatRows sql.NullInt32,
+    seatCols sql.NullInt32,
+    excludeID *uint64,
+) (bool, error) {
+    // Build the query dynamically to account for nullable fields.
+    q := `SELECT 1 FROM halls WHERE owner_id = ?`
+    args := []any{ownerID}
+
+    if cinemaID == nil {
+        q += " AND cinema_id IS NULL"
+    } else {
+        q += " AND cinema_id = ?"
+        args = append(args, *cinemaID)
+    }
+
+    q += " AND name = ?"
+    args = append(args, name)
+
+    if description.Valid {
+        q += " AND description = ?"
+        args = append(args, description)
+    } else {
+        q += " AND description IS NULL"
+    }
+
+    if seatRows.Valid {
+        q += " AND seat_rows = ?"
+        args = append(args, seatRows)
+    } else {
+        q += " AND seat_rows IS NULL"
+    }
+
+    if seatCols.Valid {
+        q += " AND seat_cols = ?"
+        args = append(args, seatCols)
+    } else {
+        q += " AND seat_cols IS NULL"
+    }
+
+    if excludeID != nil {
+        q += " AND id <> ?"
+        args = append(args, *excludeID)
+    }
+
+    q += " LIMIT 1"
+
+    var tmp int
+    err := r.db.QueryRowContext(ctx, q, args...).Scan(&tmp)
+    if err != nil {
+        if err == sql.ErrNoRows {
+            return false, nil
+        }
+        return false, err
+    }
+    return true, nil
 }

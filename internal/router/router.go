@@ -33,8 +33,10 @@ func RegisterAuth(e *echo.Echo, a *handler.AuthHandler, jwtSecret string) {
 	g.POST("/register", a.Register)
 	// Register a POST endpoint to handle user login at /v1/auth/login.
 	g.POST("/login", a.Login)
-	// Register a POST endpoint to refresh access tokens at /v1/auth/refresh.
-	g.POST("/refresh", a.Refresh)
+    // Register a POST endpoint to refresh access tokens at /v1/auth/refresh. This rotates the refresh token.
+    g.POST("/refresh", a.Refresh)
+    // Register a POST endpoint to issue a new access token without rotating the refresh token.
+    g.POST("/refresh-access", a.RefreshAccess)
 	// Register a POST endpoint to log out using a refresh token.  Unlike
 	// previous iterations, logout does not require JWT authentication. The
 	// handler accepts a JSON body containing a `refresh_token` and will

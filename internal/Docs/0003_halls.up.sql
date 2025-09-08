@@ -15,12 +15,9 @@ CREATE TABLE IF NOT EXISTS halls (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
-  -- enforce unique hall names per owner.  This index will later be
-  -- updated to include cinema_id once that column is added in a
-  -- subsequent migration.  The default here preserves backwards
-  -- compatibility for installations that have not yet adopted the
-  -- cinema feature.
-  UNIQUE KEY uk_owner_name (owner_id, name),
+  -- index hall names per owner.  This index is non-unique because duplicate names are allowed;
+  -- enforcement of identical hall attributes is handled in the application layer.
+  KEY idx_owner_name (owner_id, name),
   KEY idx_owner (owner_id),
   CONSTRAINT fk_halls_owner FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -225,7 +225,8 @@ ALTER TABLE `cinemas`
 --
 ALTER TABLE `halls`
   ADD PRIMARY KEY (`id`),
-  ADD UNIQUE KEY `uk_owner_name` (`owner_id`,`name`),
+  ADD KEY `idx_owner_name` (`owner_id`,`name`),
+  ADD KEY `idx_owner_cinema_name` (`owner_id`,`cinema_id`,`name`),
   ADD KEY `idx_owner` (`owner_id`),
   ADD KEY `fk_halls_cinema` (`cinema_id`);
 
