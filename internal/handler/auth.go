@@ -189,6 +189,41 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 	})
 }
 
+// RefreshAccess: validate a refresh token and return a new access token WITHOUT rotating the refresh token.
+// This endpoint can be used to obtain a fresh short-lived access token while reusing an existing refresh token.
+func (h *AuthHandler) RefreshAccess(c echo.Context) error {
+    var req refreshReq
+    if err := c.Bind(&req); err != nil || strings.TrimSpace(req.RefreshToken) == "" {
+        return c.JSON(http.StatusBadRequest, echo.Map{"error": "refresh_token required"})
+    }
+    raw := strings.TrimSpace(req.RefreshToken)
+    hash := utils.HashRefreshRaw(raw)
+
+    ctx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
+    defer cancel()
+
+    userID, err := h.Tokens.ValidateRefresh(ctx, hash)
+    if err != nil {
+        // Invalid, expired or revoked refresh token
+        return c.JSON(http.StatusUnauthorized, echo.Map{"error": "invalid refresh"})
+    }
+    u, err := h.Users.GetByID(ctx, userID)
+    if err != nil {
+        if err == sql.ErrNoRows {
+            return c.JSON(http.StatusUnauthorized, echo.Map{"error": "invalid refresh"})
+        }
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "load user failed"})
+    }
+    access, err := utils.NewAccessToken(h.Cfg.JWTSecret, userID, u.Role, h.Cfg.AccessTTLMin)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "issue access failed"})
+    }
+    // Only return a new access token; do not rotate the refresh token
+    return c.JSON(http.StatusOK, echo.Map{
+        "access": tokenPart{Token: access.Token, Expires: access.Exp},
+    })
+}
+
 // Logout: revoke all refresh tokens for current user (protected).
 func (h *AuthHandler) Logout(c echo.Context) error {
     // The logout handler now supports two modes of operation: revoking a

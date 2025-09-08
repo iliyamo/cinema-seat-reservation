@@ -58,15 +58,23 @@ func main() {
     // initialise repositories for owner operations.  Cinemas, halls, seats,
     // shows and show seats each have their own repository to isolate
     // persistence logic.
-    cr := repository.NewCinemaRepo(db)      // cinema repository
-    hr := repository.NewHallRepo(db)        // hall repository
-    sr := repository.NewSeatRepo(db)        // seat repository
-    shwr := repository.NewShowRepo(db)      // show repository
-    ssr := repository.NewShowSeatRepo(db)   // show seat repository
-    // construct the owner handler with all the repositories
-    ownerH := handler.NewOwnerHandler(cr, hr, sr, shwr, ssr)
-    // register owner routes requiring JWT auth and OWNER role
-    router.RegisterOwner(e, ownerH, cfg.JWTSecret)
+        cr := repository.NewCinemaRepo(db)      // cinema repository
+        hr := repository.NewHallRepo(db)        // hall repository
+        sr := repository.NewSeatRepo(db)        // seat repository
+        shwr := repository.NewShowRepo(db)      // show repository
+        ssr := repository.NewShowSeatRepo(db)   // show seat repository
+        // construct the public handler for unauthenticated browse endpoints
+        publicH := &handler.PublicHandler{
+            CinemaRepo: cr,
+            HallRepo:   hr,
+            ShowRepo:   shwr,
+        }
+        // register public routes before protected owner routes
+        router.RegisterPublic(e, publicH)
+        // construct the owner handler with all the repositories
+        ownerH := handler.NewOwnerHandler(cr, hr, sr, shwr, ssr)
+        // register owner routes requiring JWT auth and OWNER role
+        router.RegisterOwner(e, ownerH, cfg.JWTSecret)
 
     addr := ":" + cfg.Port                    // build the address string using the configured port
     log.Printf("listening on %s (env=%s)", addr, cfg.Env) // log where the server is about to start

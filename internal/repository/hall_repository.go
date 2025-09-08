@@ -1,4 +1,8 @@
-package repository // repository holds data access logic for domain entities
+// Package repository holds data access logic for domain entities. This file defines
+// the Hall model and related repository methods. A Hall represents a screening room
+// within a cinema. Sensitive fields such as OwnerID, CreatedAt and UpdatedAt
+// should not be exposed via public API responses.
+package repository
 
 import (
 	"context"      // context is used to manage deadlines and cancellation
@@ -6,8 +10,8 @@ import (
 	"errors"       // errors package allows sentinel error definitions
 )
 
-// Hall represents a screening hall within a cinema.  Each hall belongs to
-// a cinema and an owner.  SeatRows and SeatCols describe the seat layout.
+// Hall represents a screening hall within a cinema. Each hall belongs to
+// a cinema and an owner. SeatRows and SeatCols describe the seat layout.
 type Hall struct {
 	ID          uint64         // ID is the primary key of the hall
 	OwnerID     uint64         // OwnerID references the owning user's ID
@@ -23,6 +27,8 @@ type Hall struct {
 
 // ErrHallNotFound is returned when a hall lookup fails.
 var ErrHallNotFound = errors.New("hall not found")
+// ErrHallConflict is returned when another hall with identical attributes exists.
+var ErrHallConflict = errors.New("hall already exists with identical attributes")
 
 // HallRepo provides methods to create and retrieve halls.  It embeds a
 // database handle to perform queries and commands.
@@ -37,9 +43,10 @@ func NewHallRepo(db *sql.DB) *HallRepo {
 
 // Create inserts a new hall into the database.  The hall must have
 // OwnerID and Name set.  CinemaID, Rows and Cols may be nil to support
-// old behaviour but should be provided for new halls.  After insert
-// the ID field of the hall will be set. سپس رکورد خوانده می‌شود تا
-// فیلدهای زمان و وضعیت هم پر شوند.
+// old behaviour but should be provided for new halls.  After the insert
+// the ID field of the hall will be set.  A subsequent SELECT will run
+// to populate timestamp and status fields so the returned object is
+// fully populated.
 func (r *HallRepo) Create(ctx context.Context, h *Hall) error {
 	const qInsert = `INSERT INTO halls (owner_id, cinema_id, name, description, seat_rows, seat_cols)
 	                 VALUES (?, ?, ?, ?, ?, ?)`
@@ -53,15 +60,13 @@ func (r *HallRepo) Create(ctx context.Context, h *Hall) error {
 	}
 	h.ID = uint64(id)
 
-	// رکورد را بخوان تا is_active, created_at, updated_at و مقادیر نهایی ست شوند.
-	const qSelect = `SELECT id, owner_id, cinema_id, name, description, seat_rows, seat_cols, is_active, created_at, updated_at
-	                 FROM halls WHERE id = ?`
-	if err := r.db.QueryRowContext(ctx, qSelect, h.ID).
-		Scan(&h.ID, &h.OwnerID, &h.CinemaID, &h.Name, &h.Description, &h.SeatRows, &h.SeatCols, &h.IsActive, &h.CreatedAt, &h.UpdatedAt); err != nil {
-		return err
-	}
-
-	return nil
+    // Perform a follow‑up SELECT to populate computed fields (is_active, created_at, updated_at).
+    const qSelect = `SELECT id, owner_id, cinema_id, name, description, seat_rows, seat_cols, is_active, created_at, updated_at
+                     FROM halls WHERE id = ?`
+    if err := r.db.QueryRowContext(ctx, qSelect, h.ID).Scan(&h.ID, &h.OwnerID, &h.CinemaID, &h.Name, &h.Description, &h.SeatRows, &h.SeatCols, &h.IsActive, &h.CreatedAt, &h.UpdatedAt); err != nil {
+        return err
+    }
+    return nil
 }
 
 // GetByID retrieves a hall by its ID regardless of owner.  It returns
@@ -124,20 +129,121 @@ func (r *HallRepo) ListByCinemaAndOwner(ctx context.Context, cinemaID, ownerID u
 	return out, nil
 }
 
+// ListByCinema returns all halls inside a cinema regardless of owner. It is used
+// by public browse endpoints to show available halls to unauthenticated users.
+func (r *HallRepo) ListByCinema(ctx context.Context, cinemaID uint64) ([]*Hall, error) {
+    const q = `SELECT id, owner_id, cinema_id, name, description, seat_rows, seat_cols, is_active, created_at, updated_at
+               FROM halls
+               WHERE cinema_id = ?
+               ORDER BY id`
+    rows, err := r.db.QueryContext(ctx, q, cinemaID)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    var out []*Hall
+    for rows.Next() {
+        h := new(Hall)
+        if err := rows.Scan(&h.ID, &h.OwnerID, &h.CinemaID, &h.Name, &h.Description,
+            &h.SeatRows, &h.SeatCols, &h.IsActive, &h.CreatedAt, &h.UpdatedAt); err != nil {
+            return nil, err
+        }
+        out = append(out, h)
+    }
+    if err := rows.Err(); err != nil {
+        return nil, err
+    }
+    return out, nil
+}
+
 // UpdateByIDAndOwner updates hall fields (name/description/seat_rows/seat_cols)
 // if the hall belongs to the given owner.  Returns sql.ErrNoRows when not found.
 func (r *HallRepo) UpdateByIDAndOwner(ctx context.Context, h *Hall) error {
-	const q = `UPDATE halls
+    // Before updating, ensure there is no other hall with identical attributes.
+    ok, err := r.ExistsExact(ctx, h.OwnerID, h.CinemaID, h.Name, h.Description, h.SeatRows, h.SeatCols, &h.ID)
+    if err != nil {
+        return err
+    }
+    if ok {
+        return ErrHallConflict
+    }
+    const q = `UPDATE halls
                SET name = ?, description = ?, seat_rows = ?, seat_cols = ?, updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND owner_id = ?`
-	res, err := r.db.ExecContext(ctx, q,
-		h.Name, h.Description, h.SeatRows, h.SeatCols, h.ID, h.OwnerID,
-	)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+    res, err := r.db.ExecContext(ctx, q,
+        h.Name, h.Description, h.SeatRows, h.SeatCols, h.ID, h.OwnerID,
+    )
+    if err != nil {
+        return err
+    }
+    if n, _ := res.RowsAffected(); n == 0 {
+        return sql.ErrNoRows
+    }
+    return nil
+}
+
+// ExistsExact returns true if a hall already exists for the given owner and cinema
+// with exactly the same name, description, seatRows and seatCols.  The excludeID
+// parameter, when non-nil, excludes that particular hall from the comparison.
+func (r *HallRepo) ExistsExact(
+    ctx context.Context,
+    ownerID uint64,
+    cinemaID *uint64,
+    name string,
+    description sql.NullString,
+    seatRows sql.NullInt32,
+    seatCols sql.NullInt32,
+    excludeID *uint64,
+) (bool, error) {
+    // Build the query dynamically to account for nullable fields.
+    q := `SELECT 1 FROM halls WHERE owner_id = ?`
+    args := []any{ownerID}
+
+    if cinemaID == nil {
+        q += " AND cinema_id IS NULL"
+    } else {
+        q += " AND cinema_id = ?"
+        args = append(args, *cinemaID)
+    }
+
+    q += " AND name = ?"
+    args = append(args, name)
+
+    if description.Valid {
+        q += " AND description = ?"
+        args = append(args, description)
+    } else {
+        q += " AND description IS NULL"
+    }
+
+    if seatRows.Valid {
+        q += " AND seat_rows = ?"
+        args = append(args, seatRows)
+    } else {
+        q += " AND seat_rows IS NULL"
+    }
+
+    if seatCols.Valid {
+        q += " AND seat_cols = ?"
+        args = append(args, seatCols)
+    } else {
+        q += " AND seat_cols IS NULL"
+    }
+
+    if excludeID != nil {
+        q += " AND id <> ?"
+        args = append(args, *excludeID)
+    }
+
+    q += " LIMIT 1"
+
+    var tmp int
+    err := r.db.QueryRowContext(ctx, q, args...).Scan(&tmp)
+    if err != nil {
+        if err == sql.ErrNoRows {
+            return false, nil
+        }
+        return false, err
+    }
+    return true, nil
 }

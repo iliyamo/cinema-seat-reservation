@@ -1,4 +1,8 @@
-package repository // repository for show domain operations
+// Package repository contains data access logic for Show domain operations. This file defines
+// the Show model and repository methods for shows. A Show represents a scheduled
+// screening of a movie in a hall. Sensitive fields such as BasePriceCents,
+// Status, CreatedAt and UpdatedAt should not be exposed via public API responses.
+package repository
 
 import (
 	"context"      // context for controlling query lifetime
@@ -110,6 +114,36 @@ func (r *ShowRepo) ListByHallAndOwner(ctx context.Context, hallID, ownerID uint6
 		return nil, err
 	}
 	return result, nil
+}
+
+// ListByHall returns all shows for a given hall regardless of owner. It is used by
+// public browse endpoints to display available shows to unauthenticated users. Shows
+// are ordered by their start time ascending.
+func (r *ShowRepo) ListByHall(ctx context.Context, hallID uint64) ([]Show, error) {
+    const q = `SELECT s.id, s.hall_id, s.title, s.starts_at, s.ends_at, s.base_price_cents, s.status, s.created_at, s.updated_at
+               FROM shows s
+               WHERE s.hall_id = ?
+               ORDER BY s.starts_at ASC`
+    rows, err := r.db.QueryContext(ctx, q, hallID)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    var result []Show
+    for rows.Next() {
+        var s Show
+        if err := rows.Scan(
+            &s.ID, &s.HallID, &s.Title, &s.StartsAt, &s.EndsAt,
+            &s.BasePriceCents, &s.Status, &s.CreatedAt, &s.UpdatedAt,
+        ); err != nil {
+            return nil, err
+        }
+        result = append(result, s)
+    }
+    if err := rows.Err(); err != nil {
+        return nil, err
+    }
+    return result, nil
 }
 
 // FindOverlapping finds all shows in the specified hall whose scheduled time overlaps

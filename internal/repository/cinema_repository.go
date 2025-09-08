@@ -1,4 +1,8 @@
-package repository // repository contains data access logic separated from handlers
+// Package repository contains data access logic separated from HTTP handlers.
+// This file defines the Cinema model and repository methods for CRUD and lookup
+// operations. A Cinema represents a venue that can contain multiple halls.
+// Only minimal fields (ID and Name) should be exposed in public API responses.
+package repository
 
 import (
 	"context"      // context allows passing deadlines and cancellation signals to DB operations
@@ -6,9 +10,9 @@ import (
 	"errors"       // errors is used to define custom error values
 )
 
-// Cinema represents a cinema entity persisted in the database.  Each
-// cinema belongs to a single owner and may contain multiple halls.  The
-// ID field is the primary key and is auto-incremented by the DB.
+// Cinema represents a cinema entity persisted in the database. Each cinema belongs to a single owner
+// and may contain multiple halls. The ID field is the primary key and is auto-incremented by the DB.
+// Note: OwnerID, CreatedAt and UpdatedAt should not be exposed via public API responses.
 type Cinema struct {
 	ID        uint64 // ID is the unique identifier of the cinema
 	OwnerID   uint64 // OwnerID references the users.id of the cinema owner
@@ -34,8 +38,9 @@ func NewCinemaRepo(db *sql.DB) *CinemaRepo {
 }
 
 // Create inserts a new cinema into the database.  On success the cinema's
-// ID field will be populated with the auto-generated value.  سپس رکورد
-// ایجادشده خوانده می‌شود تا CreatedAt/UpdatedAt هم پر شوند.
+// ID field will be populated with the auto‑generated value.  After the
+// insert, a SELECT is executed to populate the CreatedAt and UpdatedAt
+// fields so that callers receive a fully populated record.
 func (r *CinemaRepo) Create(ctx context.Context, c *Cinema) error {
 	const qInsert = "INSERT INTO cinemas (owner_id, name) VALUES (?, ?)"
 	res, err := r.db.ExecContext(ctx, qInsert, c.OwnerID, c.Name)
@@ -48,13 +53,12 @@ func (r *CinemaRepo) Create(ctx context.Context, c *Cinema) error {
 	}
 	c.ID = uint64(id)
 
-	// فیلدهای زمانی را هم با یک SELECT پر می‌کنیم تا پاسخ API کامل باشد.
-	const qSelect = "SELECT owner_id, name, created_at, updated_at FROM cinemas WHERE id = ?"
-	if err := r.db.QueryRowContext(ctx, qSelect, c.ID).
-		Scan(&c.OwnerID, &c.Name, &c.CreatedAt, &c.UpdatedAt); err != nil {
-		return err
-	}
-	return nil
+    // Perform a follow‑up SELECT to populate default timestamp fields (created_at, updated_at).
+    const qSelect = "SELECT owner_id, name, created_at, updated_at FROM cinemas WHERE id = ?"
+    if err := r.db.QueryRowContext(ctx, qSelect, c.ID).Scan(&c.OwnerID, &c.Name, &c.CreatedAt, &c.UpdatedAt); err != nil {
+        return err
+    }
+    return nil
 }
 
 // GetByID fetches a cinema by its ID regardless of owner.  It returns
@@ -125,4 +129,28 @@ func (r *CinemaRepo) UpdateName(ctx context.Context, id, ownerID uint64, name st
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// ListAll returns all cinemas regardless of owner. It is used for public browsing
+// endpoints to present available cinemas to unauthenticated users. Only ID and
+// Name fields are selected to avoid exposing sensitive owner or timestamp fields.
+func (r *CinemaRepo) ListAll(ctx context.Context) ([]*Cinema, error) {
+    const q = `SELECT id, name FROM cinemas ORDER BY id`
+    rows, err := r.db.QueryContext(ctx, q)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    var out []*Cinema
+    for rows.Next() {
+        c := &Cinema{}
+        if err := rows.Scan(&c.ID, &c.Name); err != nil {
+            return nil, err
+        }
+        out = append(out, c)
+    }
+    if err := rows.Err(); err != nil {
+        return nil, err
+    }
+    return out, nil
 }

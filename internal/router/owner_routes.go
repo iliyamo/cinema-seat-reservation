@@ -17,16 +17,20 @@ func RegisterOwner(e *echo.Echo, o *handler.OwnerHandler, jwtSecret string) {
 	)
 
 	// ---- Cinemas ----
-	g.POST("/cinemas", o.CreateCinema)
-	g.GET("/cinemas", o.ListCinemas)
-	g.PUT("/cinemas/:id", o.UpdateCinema)
-	g.PATCH("/cinemas/:id", o.UpdateCinema) // allow partial/semantic updates via PATCH as well
+    g.POST("/cinemas", o.CreateCinema)
+    // NOTE: Listing cinemas is handled by the public browse API.  Owner‑scoped
+    // list endpoints have been removed to avoid route conflicts with the
+    // public /v1/cinemas handler.
+    // g.GET("/cinemas", o.ListCinemas)
+    g.PUT("/cinemas/:id", o.UpdateCinema)
+    g.PATCH("/cinemas/:id", o.UpdateCinema) // allow partial/semantic updates via PATCH as well
 
 	// ---- Halls ----
-	g.POST("/halls", o.CreateHall)
-	g.PUT("/halls/:id", o.UpdateHall)
-	g.PATCH("/halls/:id", o.UpdateHall)
-	g.GET("/cinemas/:cinema_id/halls", o.ListHallsInCinema)
+    g.POST("/halls", o.CreateHall)
+    g.PUT("/halls/:id", o.UpdateHall)
+    g.PATCH("/halls/:id", o.UpdateHall)
+    // NOTE: Listing halls by cinema is provided by the public API (GET /v1/cinemas/:id/halls).
+    // g.GET("/cinemas/:cinema_id/halls", o.ListHallsInCinema)
 
 	// ---- Seats ----
 	g.POST("/seats", o.CreateSeat)
@@ -39,8 +43,8 @@ func RegisterOwner(e *echo.Echo, o *handler.OwnerHandler, jwtSecret string) {
     // allow full/partial updates to show properties
     g.PUT("/shows/:id", o.UpdateShow)
     g.PATCH("/shows/:id", o.UpdateShow)
-    // list shows in a hall
-    g.GET("/halls/:hall_id/shows", o.ListShowsInHall)
+    // NOTE: Listing shows in a hall is handled by the public API at /v1/halls/:id/shows.
+    // g.GET("/halls/:hall_id/shows", o.ListShowsInHall)
 
     // ---- Seats
     g.GET("/halls/:hall_id/seats", o.ListSeatsFlat)          // flat seat list by hall id

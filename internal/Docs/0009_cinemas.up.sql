@@ -26,8 +26,8 @@ ALTER TABLE halls
   ADD COLUMN seat_cols INT UNSIGNED NULL AFTER seat_rows,
   ADD CONSTRAINT fk_halls_cinema FOREIGN KEY (cinema_id) REFERENCES cinemas(id) ON DELETE RESTRICT,
   -- Drop the old unique index on (owner_id, name) if it exists and replace
-  -- it with a new composite unique index including cinema_id.  This allows
-  -- owners to reuse hall names across different cinemas while still
-  -- preventing duplicate hall names within the same cinema.
+  -- it with a new composite non-unique index including cinema_id.  This allows
+  -- owners to reuse hall names across different cinemas.  Enforcement of duplicate
+  -- halls with identical attributes is handled in application code.
   DROP INDEX uk_owner_name,
-  ADD UNIQUE KEY uk_owner_cinema_name (owner_id, cinema_id, name);
+  ADD KEY idx_owner_cinema_name (owner_id, cinema_id, name);

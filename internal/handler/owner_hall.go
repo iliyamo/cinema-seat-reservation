@@ -2,9 +2,10 @@ package handler // handler package contains owner-specific hall handlers
 
 import (
     "database/sql"                                              // sql provides nullable types and error values
-    "net/http"                                                // http defines status code constants
-    "strconv"                                                // strconv parses URL parameters to numbers
-    "strings"                                                // strings manipulates and trims text
+    "net/http"                                                 // http defines status code constants
+    "strconv"                                                 // strconv parses URL parameters to numbers
+    "strings"                                                 // strings manipulates and trims text
+    "errors"                                                  // errors package for comparing sentinels
 
     "github.com/iliyamo/cinema-seat-reservation/internal/repository" // repository exposes database models
     "github.com/labstack/echo/v4"                                   // echo framework supplies request context
@@ -71,11 +72,16 @@ func (h *OwnerHandler) CreateHall(c echo.Context) error { // begin CreateHall ha
         SeatRows:    sql.NullInt32{Int32: seatRows, Valid: true},          // number of rows stored as nullable int32
         SeatCols:    sql.NullInt32{Int32: seatCols, Valid: true},          // number of columns stored as nullable int32
     }
+    // Before creating the hall, ensure no other hall exists with identical attributes
+    if ok, err := h.HallRepo.ExistsExact(c.Request().Context(),
+        ownerID, hall.CinemaID, hall.Name, hall.Description, hall.SeatRows, hall.SeatCols, nil); err != nil {
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "db error"})
+    } else if ok {
+        return c.JSON(http.StatusConflict, map[string]string{"error": "hall already exists with identical attributes"})
+    }
     if err := h.HallRepo.Create(c.Request().Context(), hall); err != nil { // create hall in repository
-        if strings.Contains(err.Error(), "1062") { // handle duplicate hall names
-            return c.JSON(http.StatusConflict, map[string]string{"error": "hall name already exists"}) // conflict error
-        }
-        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not create hall"}) // respond with server error
+        // Unexpected error occurred
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not create hall"})
     }
     total := int(*rowsPtr) * int(*colsPtr) // calculate total seats to preallocate slice
     seats := make([]repository.Seat, 0, total) // slice to hold seat definitions
@@ -123,47 +129,54 @@ func (h *OwnerHandler) UpdateHall(c echo.Context) error { // begin UpdateHall ha
         return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"}) // respond bad request on binding error
     }
     name := cur.Name // start with current name
-    if body.Name != nil && strings.TrimSpace(*body.Name) != "" { // update name when provided and non empty
-        name = strings.TrimSpace(*body.Name) // assign trimmed new name
+    // Update name when provided and non empty
+    if body.Name != nil && strings.TrimSpace(*body.Name) != "" {
+        name = strings.TrimSpace(*body.Name)
     }
-    desc := cur.Description // start with current description
-    if body.Description != nil { // description may be nil or empty
-        s := strings.TrimSpace(*body.Description) // trim the new description
-        if s == "" { // empty string resets description
-            desc = sql.NullString{String: "", Valid: false} // mark description invalid
-        } else { // non empty sets description
-            desc = sql.NullString{String: s, Valid: true} // assign new description
+    // Build description from the request or keep current
+    desc := cur.Description
+    if body.Description != nil {
+        s := strings.TrimSpace(*body.Description)
+        if s == "" {
+            // an empty string should clear the description
+            desc = sql.NullString{String: "", Valid: false}
+        } else {
+            desc = sql.NullString{String: s, Valid: true}
         }
     }
-    rows := cur.SeatRows // start with current seat rows
-    if body.SeatRows != nil { // update rows when provided
-        if *body.SeatRows == 0 { // zero rows not allowed
-            return c.JSON(http.StatusBadRequest, map[string]string{"error": "seat_rows must be greater than zero"}) // respond validation error
+    // Determine new seat rows
+    rows := cur.SeatRows
+    if body.SeatRows != nil {
+        if *body.SeatRows == 0 {
+            return c.JSON(http.StatusBadRequest, map[string]string{"error": "seat_rows must be greater than zero"})
         }
-        rows = sql.NullInt32{Int32: int32(*body.SeatRows), Valid: true} // assign new rows
+        rows = sql.NullInt32{Int32: int32(*body.SeatRows), Valid: true}
     }
-    cols := cur.SeatCols // start with current seat columns
+    // Determine new seat columns
+    cols := cur.SeatCols
 
-    // Determine if all supplied fields match the current hall exactly.  If there are no actual
-    // changes (name, description, seat_rows and seat_cols are identical), then return a conflict.
-    {
-        // Compare name ignoring case and surrounding whitespace.
-        sameName := strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(cur.Name))
-        // Compare description; treat NULL and empty as equivalent when both are invalid.
-        sameDesc := (desc.Valid == cur.Description.Valid) && (!desc.Valid || desc.String == cur.Description.String)
-        // Compare seat_rows; if both are invalid or equal values.
-        sameRows := (rows.Valid == cur.SeatRows.Valid) && (!rows.Valid || rows.Int32 == cur.SeatRows.Int32)
-        // Compare seat_cols; if both are invalid or equal values.
-        sameCols := (cols.Valid == cur.SeatCols.Valid) && (!cols.Valid || cols.Int32 == cur.SeatCols.Int32)
-        if sameName && sameDesc && sameRows && sameCols {
-            return c.JSON(http.StatusConflict, map[string]string{"error": "hall already has these parameters"})
+    // If no seat columns were provided in the body, cols remains the current value.
+    if body.SeatCols != nil {
+        if *body.SeatCols == 0 {
+            return c.JSON(http.StatusBadRequest, map[string]string{"error": "seat_cols must be greater than zero"})
         }
+        cols = sql.NullInt32{Int32: int32(*body.SeatCols), Valid: true}
     }
-    if body.SeatCols != nil { // update columns when provided
-        if *body.SeatCols == 0 { // zero columns not allowed
-            return c.JSON(http.StatusBadRequest, map[string]string{"error": "seat_cols must be greater than zero"}) // respond validation error
+    // If all four attributes are unchanged, return a 409 Conflict: nothing to update
+    sameName := name == cur.Name
+    sameDesc := (desc.Valid == cur.Description.Valid) && (!desc.Valid || desc.String == cur.Description.String)
+    sameRows := (rows.Valid == cur.SeatRows.Valid) && (!rows.Valid || rows.Int32 == cur.SeatRows.Int32)
+    sameCols := (cols.Valid == cur.SeatCols.Valid) && (!cols.Valid || cols.Int32 == cur.SeatCols.Int32)
+    if sameName && sameDesc && sameRows && sameCols {
+        return c.JSON(http.StatusConflict, map[string]string{"error": "hall already has these parameters"})
+    }
+    // Check if another hall exists with identical attributes.  If so, return conflict.
+    {
+        if ok, err := h.HallRepo.ExistsExact(c.Request().Context(), ownerID, cur.CinemaID, name, desc, rows, cols, &id); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "db error"})
+        } else if ok {
+            return c.JSON(http.StatusConflict, map[string]string{"error": "hall name/rows/cols/desc already used by another hall"})
         }
-        cols = sql.NullInt32{Int32: int32(*body.SeatCols), Valid: true} // assign new columns
     }
     upd := &repository.Hall{ // build hall update structure
         ID:          id,               // hall ID
@@ -178,29 +191,14 @@ func (h *OwnerHandler) UpdateHall(c echo.Context) error { // begin UpdateHall ha
         UpdatedAt:   cur.UpdatedAt,    // preserve last update timestamp
     }
     if err := h.HallRepo.UpdateByIDAndOwner(c.Request().Context(), upd); err != nil { // persist hall changes
-        // If no rows were affected then the hall was not found for the owner.
         if err == sql.ErrNoRows {
             return c.JSON(http.StatusNotFound, map[string]string{"error": "hall not found"})
         }
-        // Handle duplicate hall name error gracefully.  When MySQL reports a duplicate
-        // error (1062) it means another hall owned by the same owner already has
-        // this name.  However if the name did not actually change (i.e. it's the
-        // same as the current hall's name) then this duplicate error can be
-        // ignored.  Compare the final desired name to the current name to decide.
-        if strings.Contains(err.Error(), "1062") {
-            // Only treat as conflict when the new hall name is genuinely changing to
-            // a value that is different (case-insensitive) from the current name.
-            // Trimming whitespace ensures that minor formatting differences do not
-            // produce false conflicts.  When the names are equal, we assume the
-            // duplicate error is a false positive and we ignore it.
-            if !strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(cur.Name)) {
-                return c.JSON(http.StatusConflict, map[string]string{"error": "hall name already exists"})
-            }
-            // Name did not actually change; ignore the duplicate error and continue.
-        } else {
-            // Unexpected error occurred; return 500.
-            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "update failed"})
+        // Convert repository conflict error into HTTP conflict
+        if errors.Is(err, repository.ErrHallConflict) {
+            return c.JSON(http.StatusConflict, map[string]string{"error": "hall name/rows/cols/desc already used by another hall"})
         }
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "update failed"})
     }
     // determine if seat layout changed and needs to be rebuilt
     curRows := uint32(0) // track existing rows
