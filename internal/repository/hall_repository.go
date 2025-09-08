@@ -1,4 +1,8 @@
-package repository // repository holds data access logic for domain entities
+// Package repository holds data access logic for domain entities. This file defines
+// the Hall model and related repository methods. A Hall represents a screening room
+// within a cinema. Sensitive fields such as OwnerID, CreatedAt and UpdatedAt
+// should not be exposed via public API responses.
+package repository
 
 import (
 	"context"      // context is used to manage deadlines and cancellation
@@ -6,8 +10,8 @@ import (
 	"errors"       // errors package allows sentinel error definitions
 )
 
-// Hall represents a screening hall within a cinema.  Each hall belongs to
-// a cinema and an owner.  SeatRows and SeatCols describe the seat layout.
+// Hall represents a screening hall within a cinema. Each hall belongs to
+// a cinema and an owner. SeatRows and SeatCols describe the seat layout.
 type Hall struct {
 	ID          uint64         // ID is the primary key of the hall
 	OwnerID     uint64         // OwnerID references the owning user's ID
@@ -39,9 +43,10 @@ func NewHallRepo(db *sql.DB) *HallRepo {
 
 // Create inserts a new hall into the database.  The hall must have
 // OwnerID and Name set.  CinemaID, Rows and Cols may be nil to support
-// old behaviour but should be provided for new halls.  After insert
-// the ID field of the hall will be set. سپس رکورد خوانده می‌شود تا
-// فیلدهای زمان و وضعیت هم پر شوند.
+// old behaviour but should be provided for new halls.  After the insert
+// the ID field of the hall will be set.  A subsequent SELECT will run
+// to populate timestamp and status fields so the returned object is
+// fully populated.
 func (r *HallRepo) Create(ctx context.Context, h *Hall) error {
 	const qInsert = `INSERT INTO halls (owner_id, cinema_id, name, description, seat_rows, seat_cols)
 	                 VALUES (?, ?, ?, ?, ?, ?)`
@@ -55,15 +60,13 @@ func (r *HallRepo) Create(ctx context.Context, h *Hall) error {
 	}
 	h.ID = uint64(id)
 
-	// رکورد را بخوان تا is_active, created_at, updated_at و مقادیر نهایی ست شوند.
-	const qSelect = `SELECT id, owner_id, cinema_id, name, description, seat_rows, seat_cols, is_active, created_at, updated_at
-	                 FROM halls WHERE id = ?`
-	if err := r.db.QueryRowContext(ctx, qSelect, h.ID).
-		Scan(&h.ID, &h.OwnerID, &h.CinemaID, &h.Name, &h.Description, &h.SeatRows, &h.SeatCols, &h.IsActive, &h.CreatedAt, &h.UpdatedAt); err != nil {
-		return err
-	}
-
-	return nil
+    // Perform a follow‑up SELECT to populate computed fields (is_active, created_at, updated_at).
+    const qSelect = `SELECT id, owner_id, cinema_id, name, description, seat_rows, seat_cols, is_active, created_at, updated_at
+                     FROM halls WHERE id = ?`
+    if err := r.db.QueryRowContext(ctx, qSelect, h.ID).Scan(&h.ID, &h.OwnerID, &h.CinemaID, &h.Name, &h.Description, &h.SeatRows, &h.SeatCols, &h.IsActive, &h.CreatedAt, &h.UpdatedAt); err != nil {
+        return err
+    }
+    return nil
 }
 
 // GetByID retrieves a hall by its ID regardless of owner.  It returns
@@ -124,6 +127,33 @@ func (r *HallRepo) ListByCinemaAndOwner(ctx context.Context, cinemaID, ownerID u
 		return nil, err
 	}
 	return out, nil
+}
+
+// ListByCinema returns all halls inside a cinema regardless of owner. It is used
+// by public browse endpoints to show available halls to unauthenticated users.
+func (r *HallRepo) ListByCinema(ctx context.Context, cinemaID uint64) ([]*Hall, error) {
+    const q = `SELECT id, owner_id, cinema_id, name, description, seat_rows, seat_cols, is_active, created_at, updated_at
+               FROM halls
+               WHERE cinema_id = ?
+               ORDER BY id`
+    rows, err := r.db.QueryContext(ctx, q, cinemaID)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    var out []*Hall
+    for rows.Next() {
+        h := new(Hall)
+        if err := rows.Scan(&h.ID, &h.OwnerID, &h.CinemaID, &h.Name, &h.Description,
+            &h.SeatRows, &h.SeatCols, &h.IsActive, &h.CreatedAt, &h.UpdatedAt); err != nil {
+            return nil, err
+        }
+        out = append(out, h)
+    }
+    if err := rows.Err(); err != nil {
+        return nil, err
+    }
+    return out, nil
 }
 
 // UpdateByIDAndOwner updates hall fields (name/description/seat_rows/seat_cols)
@@ -216,4 +246,73 @@ func (r *HallRepo) ExistsExact(
         return false, err
     }
     return true, nil
+}
+
+// DeleteByIDAndOwner removes a hall and all dependent records including seats,
+// shows, show seats, reservations and reservation seats. The hall must belong
+// to the provided owner; otherwise ErrForbidden is returned. If the hall
+// does not exist, sql.ErrNoRows is returned. The deletion is executed within
+// a single transaction to ensure data consistency.
+func (r *HallRepo) DeleteByIDAndOwner(ctx context.Context, id, ownerID uint64) error {
+    tx, err := r.db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    defer func() {
+        if err != nil {
+            _ = tx.Rollback()
+        } else {
+            _ = tx.Commit()
+        }
+    }()
+    // Check hall existence and ownership
+    var dbOwnerID uint64
+    err = tx.QueryRowContext(ctx, `SELECT owner_id FROM halls WHERE id = ?`, id).Scan(&dbOwnerID)
+    if err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            return sql.ErrNoRows
+        }
+        return err
+    }
+    if dbOwnerID != ownerID {
+        return ErrForbidden
+    }
+    // Remove reservation seats for shows in this hall
+    // Delete depends on reservation_seats referencing reservations and shows; we must remove these first.
+    if _, err = tx.ExecContext(ctx,
+        `DELETE rs FROM reservation_seats rs
+         JOIN shows sh ON sh.id = rs.show_id
+         WHERE sh.hall_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Remove reservations for shows in this hall
+    if _, err = tx.ExecContext(ctx,
+        `DELETE r FROM reservations r
+         JOIN shows sh ON sh.id = r.show_id
+         WHERE sh.hall_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Remove show seats for shows in this hall
+    if _, err = tx.ExecContext(ctx,
+        `DELETE ss FROM show_seats ss
+         JOIN shows sh ON sh.id = ss.show_id
+         WHERE sh.hall_id = ?`, id);
+    err != nil {
+        return err
+    }
+    // Remove shows in this hall
+    if _, err = tx.ExecContext(ctx, `DELETE FROM shows WHERE hall_id = ?`, id); err != nil {
+        return err
+    }
+    // Remove seats in this hall
+    if _, err = tx.ExecContext(ctx, `DELETE FROM seats WHERE hall_id = ?`, id); err != nil {
+        return err
+    }
+    // Finally delete the hall
+    if _, err = tx.ExecContext(ctx, `DELETE FROM halls WHERE id = ?`, id); err != nil {
+        return err
+    }
+    return nil
 }

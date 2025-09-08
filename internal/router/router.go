@@ -66,3 +66,18 @@ func RegisterAuth(e *echo.Echo, a *handler.AuthHandler, jwtSecret string) {
 	e.POST("/v1/logout", a.Logout)
 
 }
+
+// RegisterPublic registers unauthenticated browse endpoints on the provided Echo instance.
+// The provided PublicHandler exposes handlers that return sanitized data for cinemas,
+// halls and shows. These routes do not apply any JWT or role middleware and are
+// intended for guest users.
+func RegisterPublic(e *echo.Echo, p *handler.PublicHandler) {
+    // Expose list of all cinemas
+    e.GET("/v1/cinemas", p.GetPublicCinemas)
+    // List halls of a specific cinema
+    e.GET("/v1/cinemas/:id/halls", p.GetPublicHallsByCinema)
+    // List shows of a specific hall
+    e.GET("/v1/halls/:id/shows", p.GetPublicShowsByHall)
+    // Show details by show id
+    e.GET("/v1/shows/:id", p.GetPublicShow)
+}

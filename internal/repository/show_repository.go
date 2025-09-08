@@ -1,4 +1,8 @@
-package repository // repository for show domain operations
+// Package repository contains data access logic for Show domain operations. This file defines
+// the Show model and repository methods for shows. A Show represents a scheduled
+// screening of a movie in a hall. Sensitive fields such as BasePriceCents,
+// Status, CreatedAt and UpdatedAt should not be exposed via public API responses.
+package repository
 
 import (
 	"context"      // context for controlling query lifetime
@@ -112,6 +116,36 @@ func (r *ShowRepo) ListByHallAndOwner(ctx context.Context, hallID, ownerID uint6
 	return result, nil
 }
 
+// ListByHall returns all shows for a given hall regardless of owner. It is used by
+// public browse endpoints to display available shows to unauthenticated users. Shows
+// are ordered by their start time ascending.
+func (r *ShowRepo) ListByHall(ctx context.Context, hallID uint64) ([]Show, error) {
+    const q = `SELECT s.id, s.hall_id, s.title, s.starts_at, s.ends_at, s.base_price_cents, s.status, s.created_at, s.updated_at
+               FROM shows s
+               WHERE s.hall_id = ?
+               ORDER BY s.starts_at ASC`
+    rows, err := r.db.QueryContext(ctx, q, hallID)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    var result []Show
+    for rows.Next() {
+        var s Show
+        if err := rows.Scan(
+            &s.ID, &s.HallID, &s.Title, &s.StartsAt, &s.EndsAt,
+            &s.BasePriceCents, &s.Status, &s.CreatedAt, &s.UpdatedAt,
+        ); err != nil {
+            return nil, err
+        }
+        result = append(result, s)
+    }
+    if err := rows.Err(); err != nil {
+        return nil, err
+    }
+    return result, nil
+}
+
 // FindOverlapping finds all shows in the specified hall whose scheduled time overlaps
 // the provided interval [start, end).  A show overlaps when it starts before the
 // proposed end and ends after the proposed start.  Time strings must use the same
@@ -207,4 +241,60 @@ func (r *ShowRepo) UpdateByIDAndOwner(ctx context.Context, s *Show, ownerID uint
 		return err
 	}
 	return ErrNoChange // row exists but values are identical
+}
+
+// DeleteByIDAndOwner removes a show and all of its dependent records provided the
+// show belongs to a hall owned by the given owner. The deletion occurs within
+// a transaction to ensure that no partial cleanup occurs. If the show does
+// not exist, ErrShowNotFound is returned. If it is owned by another user,
+// ErrForbidden is returned. If any reservations exist for the show, the
+// deletion is aborted and ErrConflict is returned.
+func (r *ShowRepo) DeleteByIDAndOwner(ctx context.Context, id, ownerID uint64) error {
+    tx, err := r.db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    // Ensure rollback or commit at the end
+    defer func() {
+        if err != nil {
+            _ = tx.Rollback()
+        } else {
+            _ = tx.Commit()
+        }
+    }()
+    // Verify show exists and belongs to the specified owner
+    var dbOwnerID uint64
+    err = tx.QueryRowContext(ctx,
+        `SELECT h.owner_id FROM shows sh JOIN halls h ON h.id = sh.hall_id WHERE sh.id = ?`, id,
+    ).Scan(&dbOwnerID)
+    if err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            return ErrShowNotFound
+        }
+        return err
+    }
+    if dbOwnerID != ownerID {
+        return ErrForbidden
+    }
+    // Check for existing reservations referencing this show
+    var resCount int
+    if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM reservations WHERE show_id = ?`, id).Scan(&resCount); err != nil {
+        return err
+    }
+    if resCount > 0 {
+        return ErrConflict
+    }
+    // Remove reservation_seats associated with the show (should be none if resCount == 0, but defensive)
+    if _, err = tx.ExecContext(ctx, `DELETE FROM reservation_seats WHERE show_id = ?`, id); err != nil {
+        return err
+    }
+    // Remove show seats entries for the show
+    if _, err = tx.ExecContext(ctx, `DELETE FROM show_seats WHERE show_id = ?`, id); err != nil {
+        return err
+    }
+    // Delete the show itself
+    if _, err = tx.ExecContext(ctx, `DELETE FROM shows WHERE id = ?`, id); err != nil {
+        return err
+    }
+    return nil
 }
