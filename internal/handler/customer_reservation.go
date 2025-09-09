@@ -1,12 +1,14 @@
 package handler
 
 import (
-	"net/http"
-	"strconv"
-	"time"
+    "database/sql"   // for sentinel errors returned from repository
+    "errors"         // for errors.Is comparisons
+    "net/http"       // HTTP status codes
+    "strconv"        // parsing path parameters
+    "time"           // working with timestamps
 
-	"github.com/iliyamo/cinema-seat-reservation/internal/repository"
-	"github.com/labstack/echo/v4"
+    "github.com/iliyamo/cinema-seat-reservation/internal/repository" // repository layer
+    "github.com/labstack/echo/v4"                                    // Echo web framework
 )
 
 // CustomerHandler groups repositories required to perform seat holds,
@@ -333,4 +335,90 @@ func (h *CustomerHandler) ListReservations(c echo.Context) error {
 	return c.JSON(http.StatusOK, echo.Map{
 		"items": details,
 	})
+}
+
+// GetReservation handles GET /v1/reservations/:id.  It returns the
+// details of a single reservation for the authenticated user.  When
+// the reservation does not exist, it responds with 404.  When the
+// reservation belongs to a different user, it responds with 403.  Any
+// unexpected error results in a 500 response.
+func (h *CustomerHandler) GetReservation(c echo.Context) error {
+    userID, err := getUserID(c)
+    if err != nil {
+        return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
+    }
+    resID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+    if err != nil || resID == 0 {
+        return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid reservation id"})
+    }
+    ctx := c.Request().Context()
+    detail, err := h.ReservationRepo.GetByIDForUser(ctx, resID, userID)
+    if err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            // reservation not found or not owned by user (ownership enforced in repo)
+            return c.JSON(http.StatusNotFound, echo.Map{"error": "reservation not found"})
+        }
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to fetch reservation"})
+    }
+    return c.JSON(http.StatusOK, echo.Map{
+        "item": detail,
+    })
+}
+
+// DeleteReservation handles DELETE /v1/reservations/:id.  It cancels a
+// reservation belonging to the current user if the associated show has
+// not yet started.  It returns 204 on success, 404 when the
+// reservation does not exist, 403 when the reservation belongs to
+// another user, and 409 when the show has already started.  All
+// operations are executed within a transaction.
+func (h *CustomerHandler) DeleteReservation(c echo.Context) error {
+    userID, err := getUserID(c)
+    if err != nil {
+        return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
+    }
+    resID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+    if err != nil || resID == 0 {
+        return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid reservation id"})
+    }
+    ctx := c.Request().Context()
+    tx, err := h.ShowRepo.DB().BeginTx(ctx, nil)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to start transaction"})
+    }
+    committed := false
+    defer func() {
+        if !committed {
+            _ = tx.Rollback()
+        }
+    }()
+    showID, startTime, seatIDs, err := h.ReservationRepo.GetInfoForUserTx(ctx, tx, resID, userID)
+    if err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            return c.JSON(http.StatusNotFound, echo.Map{"error": "reservation not found"})
+        }
+        if errors.Is(err, repository.ErrForbidden) {
+            return c.JSON(http.StatusForbidden, echo.Map{"error": "forbidden"})
+        }
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to load reservation info"})
+    }
+    // Check if the show has already started; if so, return conflict
+    if !startTime.After(time.Now().UTC()) {
+        return c.JSON(http.StatusConflict, echo.Map{"error": "show already started"})
+    }
+    // Delete the reservation; cascade deletes reservation_seats due to FK
+    const del = `DELETE FROM reservations WHERE id = ?`
+    if _, err := tx.ExecContext(ctx, del, resID); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to delete reservation"})
+    }
+    // Return seats to FREE status
+    if len(seatIDs) > 0 {
+        if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, seatIDs, "FREE"); err != nil {
+            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
+        }
+    }
+    if err := tx.Commit(); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
+    }
+    committed = true
+    return c.NoContent(http.StatusNoContent)
 }
