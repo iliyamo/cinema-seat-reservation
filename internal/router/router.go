@@ -80,4 +80,11 @@ func RegisterPublic(e *echo.Echo, p *handler.PublicHandler) {
     e.GET("/v1/halls/:id/shows", p.GetPublicShowsByHall)
     // Show details by show id
     e.GET("/v1/shows/:id", p.GetPublicShow)
+    // Publicly view the seating layout of a hall (rows and columns of seats)
+    // This endpoint returns the raw seat grid grouped by row.  Authentication is not required so that
+    // guests can preview a hall before selecting seats.
+    e.GET("/v1/halls/:id/seats/layout", p.GetPublicHallLayout)
+    // Publicly view seat availability for a specific show.  Seat status is derived from show seats and active holds.
+    // Status values can be FREE, HELD or RESERVED.
+    e.GET("/v1/shows/:id/seats", p.GetPublicShowSeats)
 }
