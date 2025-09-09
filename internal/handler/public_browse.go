@@ -11,45 +11,30 @@ import (
     "strconv"   // string to integer conversion utilities
     "strings"   // trimming and other string helpers
     "time"      // parsing and formatting timestamps
+    "sort"      // sorting helpers for row labels
 
     "github.com/labstack/echo/v4"                         // Echo web framework
     "github.com/iliyamo/cinema-seat-reservation/internal/repository" // repository interfaces
 )
 
-
-
-func parseToISO(ts string) *string {
-    ts = strings.TrimSpace(ts)
-    if ts == "" || ts == "0001-01-01 00:00:00" {
-        return nil
-    }
-    // Try common layouts
-    layouts := []string{
-        time.RFC3339,
-        time.RFC3339Nano,
-        "2006-01-02 15:04:05",           // MySQL DATETIME
-        "2006-01-02 15:04:05 -0700 MST", // Go default String() for time.Time
-        "2006-01-02T15:04:05",           // ISO without zone
-    }
-    for _, layout := range layouts {
-        if t, err := time.Parse(layout, ts); err == nil {
-            iso := t.UTC().Format(time.RFC3339)
-            return &iso
-        }
-        // Try parsing in UTC location for non-zone layouts
-        if t, err := time.ParseInLocation(layout, ts, time.UTC); err == nil {
-            iso := t.UTC().Format(time.RFC3339)
-            return &iso
-        }
-    }
-    return nil
-}
 // PublicHandler aggregates repositories needed for unauthenticated browsing.
 // It produces sanitized responses suitable for public consumption.
 type PublicHandler struct {
     CinemaRepo *repository.CinemaRepo // provides access to cinema data
     HallRepo   *repository.HallRepo   // provides access to hall data
     ShowRepo   *repository.ShowRepo   // provides access to show data
+
+    // SeatRepo gives access to seats for hall layout and seat status endpoints.  It
+    // is optional and may be nil in older constructions; handlers that require
+    // SeatRepo should check for nil and return an internal error if absent.
+    SeatRepo *repository.SeatRepo
+    // ShowSeatRepo gives access to show_seats for seat status computation.
+    ShowSeatRepo *repository.ShowSeatRepo
+
+    // SeatHoldRepo gives access to seat_holds for expiring holds prior to
+    // computing seat status.  It may be nil in legacy constructions; when
+    // non-nil it will be used to expire holds before listing seats.
+    SeatHoldRepo *repository.SeatHoldRepo
 }
 
 // PublicCinema represents a cinema exposed via the public API. It contains
@@ -176,8 +161,20 @@ func (h *PublicHandler) GetPublicShowsByHall(c echo.Context) error {
     out := make([]PublicShow, 0, len(shows))
     for _, s := range shows {
         var startPtr, endPtr *string
-        startPtr = parseToISO(s.StartsAt)
-        endPtr = parseToISO(s.EndsAt)
+        // parse and format start time if present
+        if ts := strings.TrimSpace(s.StartsAt); ts != "" && ts != "0001-01-01 00:00:00" {
+            if t, parseErr := time.Parse("2006-01-02 15:04:05", ts); parseErr == nil {
+                iso := t.UTC().Format(time.RFC3339)
+                startPtr = &iso
+            }
+        }
+        // parse and format end time if present
+        if te := strings.TrimSpace(s.EndsAt); te != "" && te != "0001-01-01 00:00:00" {
+            if et, parseErr := time.Parse("2006-01-02 15:04:05", te); parseErr == nil {
+                iso := et.UTC().Format(time.RFC3339)
+                endPtr = &iso
+            }
+        }
         out = append(out, PublicShow{ID: s.ID, Title: s.Title, StartTime: startPtr, EndTime: endPtr})
     }
     return c.JSON(http.StatusOK, echo.Map{"items": out})
@@ -198,8 +195,20 @@ func (h *PublicHandler) GetPublicShow(c echo.Context) error {
         }
         return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
     }
-    startPtr := parseToISO(s.StartsAt)
-    endPtr := parseToISO(s.EndsAt)
+    // parse start and end times; assign nil pointers if invalid or zero
+    var startPtr, endPtr *string
+    if ts := strings.TrimSpace(s.StartsAt); ts != "" && ts != "0001-01-01 00:00:00" {
+        if t, parseErr := time.Parse("2006-01-02 15:04:05", ts); parseErr == nil {
+            iso := t.UTC().Format(time.RFC3339)
+            startPtr = &iso
+        }
+    }
+    if te := strings.TrimSpace(s.EndsAt); te != "" && te != "0001-01-01 00:00:00" {
+        if et, parseErr := time.Parse("2006-01-02 15:04:05", te); parseErr == nil {
+            iso := et.UTC().Format(time.RFC3339)
+            endPtr = &iso
+        }
+    }
     resp := PublicShowDetail{ID: s.ID, Title: s.Title, StartTime: startPtr, EndTime: endPtr}
     // load hall to get hall name and cinema ID
     if hall, err := h.HallRepo.GetByID(ctx, s.HallID); err == nil {
@@ -214,4 +223,229 @@ func (h *PublicHandler) GetPublicShow(c echo.Context) error {
         }
     }
     return c.JSON(http.StatusOK, resp)
+}
+
+// GetPublicHallLayout handles GET /v1/halls/:id/seats/layout for unauthenticated users.
+// It returns the seating layout grouped by row along with the maximum column
+// count.  Seats are retrieved from the SeatRepo.  The optional query
+// parameter "active" may be supplied to filter by the seat's is_active
+// flag (true or false).  If SeatRepo is nil, an internal server error
+// is returned.  This endpoint does not require authentication and is
+// intended for customers to view seat arrangements before selecting seats.
+func (h *PublicHandler) GetPublicHallLayout(c echo.Context) error {
+    if h.SeatRepo == nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "seat repository not configured"})
+    }
+    ctx := c.Request().Context()
+    hallID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+    if err != nil || hallID == 0 {
+        return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid id"})
+    }
+    // ensure hall exists
+    if _, err := h.HallRepo.GetByID(ctx, hallID); err != nil {
+        if err == repository.ErrHallNotFound {
+            return c.JSON(http.StatusNotFound, echo.Map{"error": "hall not found"})
+        }
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
+    }
+    seats, err := h.SeatRepo.GetByHall(ctx, hallID)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
+    }
+    // optional active filter
+    if v := strings.ToLower(strings.TrimSpace(c.QueryParam("active"))); v == "true" || v == "1" || v == "false" || v == "0" {
+        want := v == "true" || v == "1"
+        filtered := make([]repository.Seat, 0, len(seats))
+        for _, s := range seats {
+            if s.IsActive == want {
+                filtered = append(filtered, s)
+            }
+        }
+        seats = filtered
+    }
+    // group by row and build output similar to owner layout
+    rowsMap := make(map[string][]uint32)
+    maxCols := 0
+    for _, s := range seats {
+        lbl := strings.ToUpper(strings.TrimSpace(s.RowLabel))
+        rowsMap[lbl] = append(rowsMap[lbl], s.SeatNumber)
+        if int(s.SeatNumber) > maxCols {
+            maxCols = int(s.SeatNumber)
+        }
+    }
+    // order row labels using rowLabelToIndex helper if available in owner
+    rowOrder := make([]string, 0, len(rowsMap))
+    for lbl := range rowsMap {
+        rowOrder = append(rowOrder, lbl)
+    }
+    sort.Slice(rowOrder, func(i, j int) bool {
+        ii, okI := rowLabelToIndex(rowOrder[i])
+        jj, okJ := rowLabelToIndex(rowOrder[j])
+        if !okI || !okJ {
+            return rowOrder[i] < rowOrder[j]
+        }
+        return ii < jj
+    })
+    type rowOut struct {
+        RowLabel string   `json:"row_label"`
+        Numbers  []uint32 `json:"numbers"`
+    }
+    rowsOut := make([]rowOut, 0, len(rowOrder))
+    pretty := make([]string, 0, len(rowOrder))
+    for _, lbl := range rowOrder {
+        nums := rowsMap[lbl]
+        sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
+        rowsOut = append(rowsOut, rowOut{RowLabel: lbl, Numbers: nums})
+        var b strings.Builder
+        b.WriteString(lbl)
+        b.WriteString(": ")
+        for i, n := range nums {
+            if i > 0 {
+                b.WriteString(", ")
+            }
+            b.WriteString(strconv.FormatUint(uint64(n), 10))
+        }
+        pretty = append(pretty, b.String())
+    }
+    return c.JSON(http.StatusOK, echo.Map{
+        "hall_id":  hallID,
+        "max_cols": maxCols,
+        "order":    rowOrder,
+        "rows":     rowsOut,
+        "pretty":   pretty,
+    })
+}
+
+// GetPublicShowSeats handles GET /v1/shows/:id/seats for unauthenticated users.
+// It returns the status of each seat for the given show ID.  A seat is
+// considered RESERVED when its show_seats.status is RESERVED.  It is
+// considered HELD if there exists a non-expired seat_hold for it (held by
+// any user).  Otherwise it is FREE.  The response contains an array of
+// objects with seat_id, row_label, seat_number and status.
+func (h *PublicHandler) GetPublicShowSeats(c echo.Context) error {
+    if h.ShowSeatRepo == nil || h.SeatRepo == nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "seat repositories not configured"})
+    }
+    ctx := c.Request().Context()
+    showID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+    if err != nil || showID == 0 {
+        return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid id"})
+    }
+    // ensure show exists
+    if _, err := h.ShowRepo.GetByID(ctx, showID); err != nil {
+        if err == repository.ErrShowNotFound {
+            return c.JSON(http.StatusNotFound, echo.Map{"error": "show not found"})
+        }
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
+    }
+    // Before fetching seat status, expire any holds that have passed
+    // their expiration.  This ensures that seats with expired holds
+    // become available (FREE) and are reported correctly to clients.
+    if h.SeatHoldRepo != nil {
+        // Run expiration cleanup in a short transaction.  Use the show seat
+        // repository's DB connection to begin the transaction.
+        tx, txErr := h.ShowSeatRepo.DB().BeginTx(ctx, nil)
+        if txErr == nil {
+            // If any holds have expired, they will be deleted and returned
+            // as seat IDs.  We then update those show_seats back to FREE.
+            if expired, expErr := h.SeatHoldRepo.ExpireHoldsTx(ctx, tx, showID); expErr == nil {
+                if len(expired) > 0 {
+                    _ = h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, expired, "FREE")
+                }
+                // Commit regardless of whether expired were found to avoid leaving an open transaction
+                _ = tx.Commit()
+            } else {
+                // If cleanup failed, roll back and ignore the error for seat listing
+                _ = tx.Rollback()
+            }
+        }
+    }
+    seats, err := h.ShowSeatRepo.ListWithStatus(ctx, showID)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
+    }
+    // build response items
+    type seatOut struct {
+        SeatID     uint64 `json:"seat_id"`
+        RowLabel   string `json:"row_label"`
+        SeatNumber uint32 `json:"seat_number"`
+        Status     string `json:"status"`
+    }
+    items := make([]seatOut, 0, len(seats))
+    for _, s := range seats {
+        items = append(items, seatOut{SeatID: s.SeatID, RowLabel: s.RowLabel, SeatNumber: s.SeatNumber, Status: s.Status})
+    }
+    return c.JSON(http.StatusOK, echo.Map{
+        "show_id": showID,
+        "count":   len(items),
+        "items":   items,
+    })
+}
+
+// GetPublicHallSeats handles GET /v1/halls/:id/seats for unauthenticated users.
+// It returns a flat list of seats for the given hall.  Each seat entry contains
+// the seat_id, row_label, seat_number, seat_type and is_active flag.  An
+// optional query parameter "active" may be supplied to filter results by the
+// seat's activation status (true or false).  This endpoint does not require
+// authentication and allows guests to inspect the hall's seats before
+// selecting a show.
+func (h *PublicHandler) GetPublicHallSeats(c echo.Context) error {
+    // Ensure the seat repository is configured; without it we cannot list seats.
+    if h.SeatRepo == nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "seat repository not configured"})
+    }
+    ctx := c.Request().Context()
+    hallID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+    if err != nil || hallID == 0 {
+        return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid id"})
+    }
+    // Ensure the hall exists before querying its seats.  We do not expose
+    // internal errors to clients but return 404 if the hall is not found.
+    if _, err := h.HallRepo.GetByID(ctx, hallID); err != nil {
+        if err == repository.ErrHallNotFound {
+            return c.JSON(http.StatusNotFound, echo.Map{"error": "hall not found"})
+        }
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
+    }
+    // Fetch all seats for this hall ordered by row and number.
+    seats, err := h.SeatRepo.GetByHall(ctx, hallID)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
+    }
+    // Optionally filter by the "active" query parameter.  Accepts true/false or 1/0.
+    if v := strings.ToLower(strings.TrimSpace(c.QueryParam("active"))); v == "true" || v == "1" || v == "false" || v == "0" {
+        want := v == "true" || v == "1"
+        filtered := make([]repository.Seat, 0, len(seats))
+        for _, s := range seats {
+            if s.IsActive == want {
+                filtered = append(filtered, s)
+            }
+        }
+        seats = filtered
+    }
+    // Build the response items.  We include the seat type and active flag so
+    // clients can identify special seats (e.g. VIP, ACCESSIBLE) and current
+    // availability status (soft availability, not reservation status).
+    type seatOut struct {
+        SeatID     uint64 `json:"seat_id"`
+        RowLabel   string `json:"row_label"`
+        SeatNumber uint32 `json:"seat_number"`
+        SeatType   string `json:"seat_type"`
+        IsActive   bool   `json:"is_active"`
+    }
+    items := make([]seatOut, 0, len(seats))
+    for _, s := range seats {
+        items = append(items, seatOut{
+            SeatID:     s.ID,
+            RowLabel:   s.RowLabel,
+            SeatNumber: s.SeatNumber,
+            SeatType:   s.SeatType,
+            IsActive:   s.IsActive,
+        })
+    }
+    return c.JSON(http.StatusOK, echo.Map{
+        "hall_id": hallID,
+        "count":   len(items),
+        "items":   items,
+    })
 }

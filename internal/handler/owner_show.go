@@ -53,14 +53,18 @@ func (h *OwnerHandler) CreateShow(c echo.Context) error { // begin CreateShow ha
 	}
 
 	// parse RFC3339 and normalize to UTC to match DB DATETIME storage
-	startTime, err := time.Parse(time.RFC3339, startsAt)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid starts_at format"})
-	}
-	endTime, err := time.Parse(time.RFC3339, endsAt)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid ends_at format"})
-	}
+    startTime, err := time.Parse(time.RFC3339, startsAt)
+    if err != nil {
+        return c.JSON(http.StatusBadRequest, map[string]string{
+            "error": "Invalid starts_at format. Must be RFC3339 (e.g. 2025-08-09T10:55:13Z)",
+        })
+    }
+    endTime, err := time.Parse(time.RFC3339, endsAt)
+    if err != nil {
+        return c.JSON(http.StatusBadRequest, map[string]string{
+            "error": "Invalid ends_at format. Must be RFC3339 (e.g. 2025-08-09T10:55:13Z)",
+        })
+    }
 	if !endTime.After(startTime) {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "ends_at must be after starts_at"})
 	}
@@ -86,44 +90,79 @@ func (h *OwnerHandler) CreateShow(c echo.Context) error { // begin CreateShow ha
 		})
 	}
 
-	// Build new show
-	show := &repository.Show{
-		HallID:         body.HallID,
-		Title:          title,
-		StartsAt:       startStr,
-		EndsAt:         endStr,
-		BasePriceCents: price,
-	}
-	// Create show
-	if err := h.ShowRepo.Create(c.Request().Context(), show); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not create show"})
-	}
+    // Build new show record to be persisted.  ID and timestamp fields will be
+    // populated after insertion.  Times have already been validated and formatted.
+    show := &repository.Show{
+        HallID:         body.HallID,
+        Title:          title,
+        StartsAt:       startStr,
+        EndsAt:         endStr,
+        BasePriceCents: price,
+    }
 
-	// Create show seats for all seats in the hall
-	seats, err := h.SeatRepo.GetByHall(c.Request().Context(), body.HallID)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load seats"})
-	}
-	ss := make([]repository.ShowSeat, 0, len(seats))
-	for _, seat := range seats {
-		ss = append(ss, repository.ShowSeat{
-			ShowID:     show.ID,
-			SeatID:     seat.ID,
-			Status:     "FREE",
-			PriceCents: price,
-			Version:    1,
-		})
-	}
-	if err := h.ShowSeatRepo.CreateBulk(c.Request().Context(), ss); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create show seats"})
-	}
+    // Preload all seats for the hall before beginning the transaction.  Should an
+    // error occur here, no transaction will be opened and the handler returns
+    // immediately.  Seats are read outside the transaction because they are
+    // immutable during show creation.
+    seats, err := h.SeatRepo.GetByHall(c.Request().Context(), body.HallID)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load seats"})
+    }
 
-	// Return the fully populated show row
-	fresh, err := h.ShowRepo.GetByID(c.Request().Context(), show.ID)
-	if err != nil {
-		return c.JSON(http.StatusCreated, show) // fallback
-	}
-	return c.JSON(http.StatusCreated, fresh)
+    // Obtain the context and begin a new transaction on the shows repository's DB.
+    ctx := c.Request().Context()
+    tx, err := h.ShowRepo.DB().BeginTx(ctx, nil)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to start transaction"})
+    }
+    // Ensure the transaction is properly closed.  This deferred function will
+    // rollback if err is set, otherwise commit.  Note that err is captured
+    // from the surrounding scope.
+    committed := false
+    defer func() {
+        if !committed {
+            _ = tx.Rollback()
+        }
+    }()
+
+    // Insert the show row within the transaction.  On success the show ID and
+    // other default fields will be populated on the struct.
+    if err = h.ShowRepo.CreateTx(ctx, tx, show); err != nil {
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not create show"})
+    }
+
+    // Construct show_seat entries corresponding to every seat in the hall.  Each
+    // seat is initialized as FREE and priced according to the show's base price.
+    ss := make([]repository.ShowSeat, 0, len(seats))
+    for _, seat := range seats {
+        ss = append(ss, repository.ShowSeat{
+            ShowID:     show.ID,
+            SeatID:     seat.ID,
+            Status:     "FREE",
+            PriceCents: price,
+            Version:    1,
+        })
+    }
+    // Persist the show_seat records using the same transaction.  Should this
+    // operation fail, the deferred rollback will execute.
+    if err = h.ShowSeatRepo.CreateBulkTx(ctx, tx, ss); err != nil {
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create show seats"})
+    }
+    // Commit the transaction.  If commit fails, the deferred rollback will run
+    // implicitly when the handler returns.
+    if err = tx.Commit(); err != nil {
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit transaction"})
+    }
+    committed = true
+
+    // Return the fully populated show row by fetching it outside the transaction.
+    fresh, err := h.ShowRepo.GetByID(ctx, show.ID)
+    if err != nil {
+        // In the unlikely event that retrieving the fresh show fails, fall
+        // back to returning the partially populated show structure.
+        return c.JSON(http.StatusCreated, show)
+    }
+    return c.JSON(http.StatusCreated, fresh)
 }
 
 // ListShowsInHall handles GET /v1/halls/:hall_id/shows and returns all shows for a hall owned by the caller.
@@ -183,14 +222,15 @@ func (h *OwnerHandler) UpdateShow(c echo.Context) error {
 	}
 
 	// optional inputs
-	var body struct {
-		Title          *string `json:"title"`
-		MovieTitle     *string `json:"movie_title"`
-		StartsAt       *string `json:"starts_at"` // RFC3339
-		EndsAt         *string `json:"ends_at"`   // RFC3339
-		BasePriceCents *uint32 `json:"base_price_cents"`
-		Status         *string `json:"status"` // SCHEDULED|CANCELLED|FINISHED
-	}
+    var body struct {
+        Title          *string `json:"title"`
+        MovieTitle     *string `json:"movie_title"`
+        StartsAt       *string `json:"starts_at"` // RFC3339 formatted start time
+        EndsAt         *string `json:"ends_at"`   // RFC3339 formatted end time
+        BasePriceCents *uint32 `json:"base_price_cents"`
+        Status         *string `json:"status"`    // SCHEDULED|CANCELLED|FINISHED
+        HallID         *uint64 `json:"hall_id"`   // optional hall change; if provided and different, seats will be rebuilt
+    }
 	if err := c.Bind(&body); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
@@ -203,51 +243,89 @@ func (h *OwnerHandler) UpdateShow(c echo.Context) error {
 		title = strings.TrimSpace(*body.Title)
 	}
 
-	start := cur.StartsAt
-	end := cur.EndsAt
-	var startChanged, endChanged bool
+    start := cur.StartsAt
+    end := cur.EndsAt
+    var startChanged, endChanged bool
 
-	if body.StartsAt != nil && strings.TrimSpace(*body.StartsAt) != "" {
-		t, err := time.Parse(time.RFC3339, strings.TrimSpace(*body.StartsAt))
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid starts_at format (RFC3339 required)"})
-		}
-		start = t.UTC().Format("2006-01-02 15:04:05") // normalize to UTC
-		startChanged = true
-	}
-	if body.EndsAt != nil && strings.TrimSpace(*body.EndsAt) != "" {
-		t, err := time.Parse(time.RFC3339, strings.TrimSpace(*body.EndsAt))
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid ends_at format (RFC3339 required)"})
-		}
-		end = t.UTC().Format("2006-01-02 15:04:05") // normalize to UTC
-		endChanged = true
-	}
+    // Determine whether the hall is changing.  Default to the current hall ID.
+    newHallID := cur.HallID
+    hallChanged := false
+    if body.HallID != nil && *body.HallID != cur.HallID {
+        // When a hall ID is provided and differs from the current show, prepare to
+        // migrate the show to the new hall.  A zero value is invalid and will be
+        // rejected below by ownership verification.
+        newHallID = *body.HallID
+        hallChanged = true
+    }
 
-	// validate & overlap check only if times changed
-	if startChanged || endChanged {
-		ts, err := time.Parse("2006-01-02 15:04:05", start)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid starts_at"})
-		}
-		te, err := time.Parse("2006-01-02 15:04:05", end)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid ends_at"})
-		}
-		if !te.After(ts) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "ends_at must be after starts_at"})
-		}
-		overlaps, err := h.ShowRepo.FindOverlappingExcluding(c.Request().Context(), cur.HallID, cur.ID, start, end)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to check overlapping shows"})
-		}
-		if len(overlaps) > 0 {
-			return c.JSON(http.StatusConflict, map[string]any{
-				"error":    "show time overlaps with existing show",
-				"overlaps": overlaps,
-			})
-		}
-	}
+    if body.StartsAt != nil && strings.TrimSpace(*body.StartsAt) != "" {
+        t, err := time.Parse(time.RFC3339, strings.TrimSpace(*body.StartsAt))
+        if err != nil {
+            return c.JSON(http.StatusBadRequest, map[string]string{
+                "error": "Invalid starts_at format. Must be RFC3339 (e.g. 2025-08-09T10:55:13Z)",
+            })
+        }
+        start = t.UTC().Format("2006-01-02 15:04:05") // normalize to UTC
+        startChanged = true
+    }
+    if body.EndsAt != nil && strings.TrimSpace(*body.EndsAt) != "" {
+        t, err := time.Parse(time.RFC3339, strings.TrimSpace(*body.EndsAt))
+        if err != nil {
+            return c.JSON(http.StatusBadRequest, map[string]string{
+                "error": "Invalid ends_at format. Must be RFC3339 (e.g. 2025-08-09T10:55:13Z)",
+            })
+        }
+        end = t.UTC().Format("2006-01-02 15:04:05") // normalize to UTC
+        endChanged = true
+    }
+
+    // Validate inputs and check for schedule conflicts when either the schedule
+    // changes (start or end time) or the hall changes.  A hall change may also
+    // require a conflict check even if the times remain the same.
+    if hallChanged || startChanged || endChanged {
+        // Parse the start and end strings back into time.Time for validation.
+        ts, err := time.Parse("2006-01-02 15:04:05", start)
+        if err != nil {
+            return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid starts_at"})
+        }
+        te, err := time.Parse("2006-01-02 15:04:05", end)
+        if err != nil {
+            return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid ends_at"})
+        }
+        // If the schedule has been modified, verify that end occurs after start.
+        if startChanged || endChanged {
+            if !te.After(ts) {
+                return c.JSON(http.StatusBadRequest, map[string]string{"error": "ends_at must be after starts_at"})
+            }
+        }
+        // When the hall is being changed, ensure the new hall exists and is owned
+        // by the caller.  This prevents moving a show to a hall owned by someone else.
+        if hallChanged {
+            if newHallID == 0 {
+                return c.JSON(http.StatusBadRequest, map[string]string{"error": "hall_id is required"})
+            }
+            if _, err := h.HallRepo.GetByIDAndOwner(c.Request().Context(), newHallID, ownerID); err != nil {
+                if err == repository.ErrHallNotFound {
+                    return c.JSON(http.StatusNotFound, map[string]string{"error": "hall not found"})
+                }
+                return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to verify hall"})
+            }
+        }
+        // Check for overlapping shows in the target hall.  Use newHallID when the
+        // hall is changing or the current hall otherwise.  Always exclude the
+        // show being updated to allow it to overlap with itself.
+        targetHallID := newHallID
+        overlaps, err := h.ShowRepo.FindOverlappingExcluding(c.Request().Context(), targetHallID, cur.ID, start, end)
+        if err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to check overlapping shows"})
+        }
+        if len(overlaps) > 0 {
+            return c.JSON(http.StatusConflict, map[string]any{
+                "error":    "show time overlaps with existing show",
+                "overlaps": overlaps,
+            })
+        }
+    }
 
 	price := cur.BasePriceCents
 	if body.BasePriceCents != nil {
@@ -265,35 +343,103 @@ func (h *OwnerHandler) UpdateShow(c echo.Context) error {
 		}
 	}
 
-	// 🔒 guard: if nothing changed, do not update
-	if title == cur.Title && start == cur.StartsAt && end == cur.EndsAt && price == cur.BasePriceCents && status == cur.Status {
-		return c.JSON(http.StatusConflict, map[string]string{"error": "no changes"})
-	}
+    // 🔒 guard: if nothing changed (and hall remains the same), do not update.  A
+    // hall change alone counts as a modification even when other fields are
+    // identical.
+    if !hallChanged && title == cur.Title && start == cur.StartsAt && end == cur.EndsAt && price == cur.BasePriceCents && status == cur.Status {
+        return c.JSON(http.StatusConflict, map[string]string{"error": "no changes"})
+    }
 
-	// perform update (ownership enforced in SQL JOIN)
-	upd := &repository.Show{
-		ID:             cur.ID,
-		HallID:         cur.HallID,
-		Title:          title,
-		StartsAt:       start,
-		EndsAt:         end,
-		BasePriceCents: price,
-		Status:         status,
-	}
+    if hallChanged {
+        // When the hall changes we must update the show row and rebuild its
+        // show_seats in a single transaction.  Preload the seats of the new hall
+        // before beginning the transaction.  If seat lookup fails, abort early.
+        seats, err := h.SeatRepo.GetByHall(c.Request().Context(), newHallID)
+        if err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load seats"})
+        }
+        ctx := c.Request().Context()
+        tx, err := h.ShowRepo.DB().BeginTx(ctx, nil)
+        if err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to start transaction"})
+        }
+        committed := false
+        defer func() {
+            if !committed {
+                _ = tx.Rollback()
+            }
+        }()
+        // Update the show row with the new hall and other fields.  We set
+        // updated_at implicitly via CURRENT_TIMESTAMP.  Ownership of the show
+        // was previously verified via cur.HallID; the new hall's ownership was
+        // validated above.
+        const uq = `UPDATE shows SET hall_id = ?, title = ?, starts_at = ?, ends_at = ?, base_price_cents = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+        if _, err = tx.ExecContext(ctx, uq, newHallID, title, start, end, price, status, cur.ID); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update show"})
+        }
+        // Remove all existing show seats for this show.  They are no longer
+        // relevant because the hall has changed.
+        if _, err = tx.ExecContext(ctx, `DELETE FROM show_seats WHERE show_id = ?`, cur.ID); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clear show seats"})
+        }
+        // Build new show_seats for the target hall.  Each seat is marked as
+        // FREE and priced according to the potentially updated base price.
+        ss := make([]repository.ShowSeat, 0, len(seats))
+        for _, seat := range seats {
+            ss = append(ss, repository.ShowSeat{
+                ShowID:     cur.ID,
+                SeatID:     seat.ID,
+                Status:     "FREE",
+                PriceCents: price,
+                Version:    1,
+            })
+        }
+        if err = h.ShowSeatRepo.CreateBulkTx(ctx, tx, ss); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create show seats"})
+        }
+        if err = tx.Commit(); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit transaction"})
+        }
+        committed = true
+        // Fetch and return the updated show record.  This will include the
+        // updated hall ID and any DB-managed fields.
+        fresh, err := h.ShowRepo.GetByID(ctx, cur.ID)
+        if err != nil {
+            return c.JSON(http.StatusOK, &repository.Show{
+                ID:             cur.ID,
+                HallID:         newHallID,
+                Title:          title,
+                StartsAt:       start,
+                EndsAt:         end,
+                BasePriceCents: price,
+                Status:         status,
+            })
+        }
+        return c.JSON(http.StatusOK, fresh)
+    }
 
-	if err := h.ShowRepo.UpdateByIDAndOwner(c.Request().Context(), upd, ownerID); err != nil {
-		if errors.Is(err, repository.ErrNoChange) {
-			return c.JSON(http.StatusConflict, map[string]string{"error": "no changes"})
-		}
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "show not found"})
-		}
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "update failed"})
-	}
-
-	fresh, err := h.ShowRepo.GetByID(c.Request().Context(), cur.ID)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load show"})
-	}
-	return c.JSON(http.StatusOK, fresh)
+    // If hall remains unchanged, perform a simple update via the repository.
+    upd := &repository.Show{
+        ID:             cur.ID,
+        HallID:         cur.HallID,
+        Title:          title,
+        StartsAt:       start,
+        EndsAt:         end,
+        BasePriceCents: price,
+        Status:         status,
+    }
+    if err := h.ShowRepo.UpdateByIDAndOwner(c.Request().Context(), upd, ownerID); err != nil {
+        if errors.Is(err, repository.ErrNoChange) {
+            return c.JSON(http.StatusConflict, map[string]string{"error": "no changes"})
+        }
+        if err == sql.ErrNoRows {
+            return c.JSON(http.StatusNotFound, map[string]string{"error": "show not found"})
+        }
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "update failed"})
+    }
+    fresh, err := h.ShowRepo.GetByID(c.Request().Context(), cur.ID)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load show"})
+    }
+    return c.JSON(http.StatusOK, fresh)
 }

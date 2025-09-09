@@ -37,6 +37,49 @@ type ShowRepo struct {
 	db *sql.DB
 }
 
+// DB exposes the underlying sql.DB.  It allows callers to begin
+// transactions spanning multiple repositories.  Use this method to
+// obtain a *sql.DB when you need fine-grained transaction control.
+func (r *ShowRepo) DB() *sql.DB {
+    return r.db
+}
+
+// CreateTx inserts a new show using the provided transaction instead of
+// the repository's DB handle.  It behaves like Create but does not
+// commit the transaction.  The caller must commit or roll back the
+// transaction.  On success, the generated ID and DB-default fields
+// (status, created_at, updated_at) are populated on the given Show.
+func (r *ShowRepo) CreateTx(ctx context.Context, tx *sql.Tx, s *Show) error {
+    const q = `INSERT INTO shows (hall_id, title, starts_at, ends_at, base_price_cents) VALUES (?, ?, ?, ?, ?)`
+    // Execute the insert using the provided transaction. Do not use
+    // r.db here to ensure the operation participates in the caller's
+    // transaction.
+    res, err := tx.ExecContext(ctx, q, s.HallID, s.Title, s.StartsAt, s.EndsAt, s.BasePriceCents)
+    if err != nil {
+        return err
+    }
+    // Retrieve the auto-incremented ID assigned by the database.
+    id, err := res.LastInsertId()
+    if err != nil {
+        return err
+    }
+    s.ID = uint64(id)
+    // Query the inserted row to obtain default fields such as status and timestamps.
+    const sel = `SELECT id, hall_id, title, starts_at, ends_at, base_price_cents, status, created_at, updated_at
+                 FROM shows WHERE id = ?`
+    return tx.QueryRowContext(ctx, sel, s.ID).Scan(
+        &s.ID,
+        &s.HallID,
+        &s.Title,
+        &s.StartsAt,
+        &s.EndsAt,
+        &s.BasePriceCents,
+        &s.Status,
+        &s.CreatedAt,
+        &s.UpdatedAt,
+    )
+}
+
 // NewShowRepo constructs a ShowRepo with the given DB handle.
 func NewShowRepo(db *sql.DB) *ShowRepo {
 	return &ShowRepo{db: db}

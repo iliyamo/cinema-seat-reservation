@@ -178,69 +178,210 @@ func (h *OwnerHandler) UpdateHall(c echo.Context) error { // begin UpdateHall ha
             return c.JSON(http.StatusConflict, map[string]string{"error": "hall name/rows/cols/desc already used by another hall"})
         }
     }
-    upd := &repository.Hall{ // build hall update structure
-        ID:          id,               // hall ID
-        OwnerID:     ownerID,          // owner ID for verification
-        CinemaID:    cur.CinemaID,     // keep existing cinema linkage
-        Name:        name,             // new or current name
-        Description: desc,             // new or current description
-        SeatRows:    rows,             // updated row count
-        SeatCols:    cols,             // updated column count
-        IsActive:    cur.IsActive,     // preserve active flag
-        CreatedAt:   cur.CreatedAt,    // preserve creation timestamp
-        UpdatedAt:   cur.UpdatedAt,    // preserve last update timestamp
+    // Determine whether the seat layout will change based on requested values.
+    curRows := uint32(0)
+    if cur.SeatRows.Valid {
+        curRows = uint32(cur.SeatRows.Int32)
     }
-    if err := h.HallRepo.UpdateByIDAndOwner(c.Request().Context(), upd); err != nil { // persist hall changes
+    curCols := uint32(0)
+    if cur.SeatCols.Valid {
+        curCols = uint32(cur.SeatCols.Int32)
+    }
+    newRows := curRows
+    newCols := curCols
+    if rows.Valid {
+        newRows = uint32(rows.Int32)
+    }
+    if cols.Valid {
+        newCols = uint32(cols.Int32)
+    }
+    gridChanged := newRows != curRows || newCols != curCols
+    if gridChanged {
+        // Before rebuilding the seat grid, ensure there are no active reservations or holds
+        // that reference seats in this hall.  If any exist, abort with a clear error.
+        ctx := c.Request().Context()
+        // Count seat holds referencing seats in this hall via seat_id join.
+        var holdCount int
+        if err := h.ShowRepo.DB().QueryRowContext(ctx,
+            `SELECT COUNT(*) FROM seat_holds h JOIN seats s ON h.seat_id = s.id WHERE s.hall_id = ?`, id,
+        ).Scan(&holdCount); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "db error"})
+        }
+        // Count reservation seats referencing seats in this hall via seat_id join.
+        var resCount int
+        if err := h.ShowRepo.DB().QueryRowContext(ctx,
+            `SELECT COUNT(*) FROM reservation_seats rs JOIN seats s ON rs.seat_id = s.id WHERE s.hall_id = ?`, id,
+        ).Scan(&resCount); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "db error"})
+        }
+        if holdCount > 0 || resCount > 0 {
+            return c.JSON(http.StatusBadRequest, map[string]string{
+                "error": "Cannot update seat grid: shows or reservations are using seats",
+            })
+        }
+
+        // Rebuild the seat layout and associated show_seats in a single transaction.
+        tx, err := h.ShowRepo.DB().BeginTx(ctx, nil)
+        if err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to start transaction"})
+        }
+        committed := false
+        defer func() {
+            if !committed {
+                _ = tx.Rollback()
+            }
+        }()
+
+        // Update hall metadata inside the transaction.  At this point we know the grid will change.
+        _, err = tx.ExecContext(ctx,
+            `UPDATE halls SET name = ?, description = ?, seat_rows = ?, seat_cols = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND owner_id = ?`,
+            name, desc, rows, cols, id, ownerID,
+        )
+        if err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update hall"})
+        }
+
+        // Remove all show_seats for shows in this hall before deleting seats to avoid FK violations.
+        if _, err = tx.ExecContext(ctx,
+            `DELETE ss FROM show_seats ss JOIN shows sh ON sh.id = ss.show_id WHERE sh.hall_id = ?`, id,
+        ); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clear show_seats"})
+        }
+
+        // Delete old seats now that show_seats are cleared.
+        if _, err = tx.ExecContext(ctx, `DELETE FROM seats WHERE hall_id = ?`, id); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete old seats"})
+        }
+
+        // Insert new seat grid.  Ensure non-zero dimensions have been validated earlier.
+        if newRows == 0 || newCols == 0 {
+            return c.JSON(http.StatusBadRequest, map[string]string{"error": "seat_rows and seat_cols must be greater than zero"})
+        }
+        var sb strings.Builder
+        sb.WriteString(`INSERT INTO seats (hall_id, row_label, seat_number, seat_type) VALUES `)
+        args := make([]any, 0, int(newRows*newCols)*4)
+        first := true
+        for r := uint32(0); r < newRows; r++ {
+            lbl := indexToRowLabel(int(r))
+            for n := uint32(1); n <= newCols; n++ {
+                if !first {
+                    sb.WriteByte(',')
+                } else {
+                    first = false
+                }
+                sb.WriteString("(?, ?, ?, ?)")
+                args = append(args, id, lbl, n, "STANDARD")
+            }
+        }
+        if _, err = tx.ExecContext(ctx, sb.String(), args...); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create new seats"})
+        }
+
+        // Fetch all shows for this hall to rebuild their show seats.
+        showRows, err := tx.QueryContext(ctx, `SELECT id, base_price_cents FROM shows WHERE hall_id = ?`, id)
+        if err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load shows"})
+        }
+        type showInfo struct {
+            id    uint64
+            price uint32
+        }
+        var shows []showInfo
+        for showRows.Next() {
+            var sid uint64
+            var price uint32
+            if err = showRows.Scan(&sid, &price); err != nil {
+                showRows.Close()
+                return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to read show"})
+            }
+            shows = append(shows, showInfo{id: sid, price: price})
+        }
+        if err = showRows.Err(); err != nil {
+            showRows.Close()
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load shows"})
+        }
+        showRows.Close()
+
+        // Load the new seat IDs for this hall, ordered for consistent seat numbering.
+        seatRows, err := tx.QueryContext(ctx, `SELECT id FROM seats WHERE hall_id = ? ORDER BY row_label, seat_number`, id)
+        if err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load seats"})
+        }
+        var seatIDs []uint64
+        for seatRows.Next() {
+            var sid uint64
+            if err = seatRows.Scan(&sid); err != nil {
+                seatRows.Close()
+                return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to read seats"})
+            }
+            seatIDs = append(seatIDs, sid)
+        }
+        if err = seatRows.Err(); err != nil {
+            seatRows.Close()
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load seats"})
+        }
+        seatRows.Close()
+
+        // For each show, rebuild its show_seats using the new seats and base price.
+        for _, sh := range shows {
+            ss := make([]repository.ShowSeat, 0, len(seatIDs))
+            for _, sid := range seatIDs {
+                ss = append(ss, repository.ShowSeat{
+                    ShowID:     sh.id,
+                    SeatID:     sid,
+                    Status:     "FREE",
+                    PriceCents: sh.price,
+                    Version:    1,
+                })
+            }
+            if err = h.ShowSeatRepo.CreateBulkTx(ctx, tx, ss); err != nil {
+                return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to rebuild show_seats"})
+            }
+        }
+
+        if err = tx.Commit(); err != nil {
+            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit transaction"})
+        }
+        committed = true
+
+        // Reload and return the updated hall record.
+        fresh, err := h.HallRepo.GetByID(ctx, id)
+        if err != nil {
+            // If retrieving the hall fails, still return the user-supplied fields.
+            return c.JSON(http.StatusOK, map[string]any{
+                "id":          id,
+                "name":        name,
+                "description": desc,
+                "seat_rows":   rows,
+                "seat_cols":   cols,
+            })
+        }
+        return c.JSON(http.StatusOK, fresh)
+    }
+    // If the seat layout does not change, simply update the hall through the repository
+    upd := &repository.Hall{
+        ID:          id,
+        OwnerID:     ownerID,
+        CinemaID:    cur.CinemaID,
+        Name:        name,
+        Description: desc,
+        SeatRows:    rows,
+        SeatCols:    cols,
+        IsActive:    cur.IsActive,
+        CreatedAt:   cur.CreatedAt,
+        UpdatedAt:   cur.UpdatedAt,
+    }
+    if err := h.HallRepo.UpdateByIDAndOwner(c.Request().Context(), upd); err != nil {
         if err == sql.ErrNoRows {
             return c.JSON(http.StatusNotFound, map[string]string{"error": "hall not found"})
         }
-        // Convert repository conflict error into HTTP conflict
         if errors.Is(err, repository.ErrHallConflict) {
             return c.JSON(http.StatusConflict, map[string]string{"error": "hall name/rows/cols/desc already used by another hall"})
         }
         return c.JSON(http.StatusInternalServerError, map[string]string{"error": "update failed"})
     }
-    // determine if seat layout changed and needs to be rebuilt
-    curRows := uint32(0) // track existing rows
-    if cur.SeatRows.Valid { // if current rows present
-        curRows = uint32(cur.SeatRows.Int32) // convert to uint32
-    }
-    curCols := uint32(0) // track existing columns
-    if cur.SeatCols.Valid { // if current columns present
-        curCols = uint32(cur.SeatCols.Int32) // convert to uint32
-    }
-    newRows := curRows // default to current rows
-    newCols := curCols // default to current columns
-    if rows.Valid { // rows may have been updated
-        newRows = uint32(rows.Int32) // use new rows
-    }
-    if cols.Valid { // columns may have been updated
-        newCols = uint32(cols.Int32) // use new columns
-    }
-    if newRows != curRows || newCols != curCols { // seat counts changed and require seat rebuild
-        if err := h.SeatRepo.DeleteByHall(c.Request().Context(), id); err != nil { // delete all existing seats for the hall
-            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete old seats"}) // respond when deletion fails
-        }
-        // build new seat definitions
-        totalSeats := int(newRows * newCols) // compute total seats for allocation
-        newSeats := make([]repository.Seat, 0, totalSeats) // allocate slice for seats
-        for r := uint32(0); r < newRows; r++ { // iterate new rows
-            lbl := indexToRowLabel(int(r)) // compute row label
-            for n := uint32(1); n <= newCols; n++ { // iterate columns starting at 1
-                newSeats = append(newSeats, repository.Seat{ // append a new seat
-                    HallID:     id,         // assign hall ID
-                    RowLabel:   lbl,         // row label
-                    SeatNumber: n,           // seat number
-                    SeatType:   "STANDARD", // default seat type
-                })
-            }
-        }
-        if err := h.SeatRepo.CreateBulk(c.Request().Context(), newSeats); err != nil { // insert new seats
-            return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create new seats"}) // respond with error if creation fails
-        }
-    }
-    fresh, _ := h.HallRepo.GetByID(c.Request().Context(), id) // fetch the updated hall without owner filter
-    return c.JSON(http.StatusOK, fresh) // return the updated hall with OK status
+    fresh, _ := h.HallRepo.GetByID(c.Request().Context(), id)
+    return c.JSON(http.StatusOK, fresh)
 }
 
 // ListHallsInCinema handles GET /v1/cinemas/:cinema_id/halls and lists halls for a cinema owned by the user
