@@ -1,24 +1,18 @@
-// Package handler exposes HTTP handlers for both authenticated and public endpoints.
-// This file defines handlers for the public browsing API. These routes allow
-// unauthenticated users to browse cinemas, halls and shows without requiring
-// authentication. Sensitive fields (owner IDs, timestamps, etc.) are filtered
-// from responses.
-
 package handler
 
 import (
-    "net/http"                                    // HTTP status codes and request context
-    "strconv"                                     // string to integer conversion utilities
-    "strings"                                     // trimming and other string helpers
-    "time"                                        // parsing and formatting timestamps
-    "sort"                                        // sorting helpers for row labels
-    "fmt"                                         // formatting Redis keys
-
-    "github.com/redis/go-redis/v9"                // Redis client (v9)
-
-    "github.com/labstack/echo/v4"                         // Echo web framework
-    "github.com/iliyamo/cinema-seat-reservation/internal/repository" // repository interfaces
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"github.com/iliyamo/cinema-seat-reservation/internal/repository"
+	"github.com/labstack/echo/v4"
+	"github.com/redis/go-redis/v9"
+	"net/http"
 )
+
+
 
 // PublicHandler aggregates repositories needed for unauthenticated browsing.
 // It produces sanitized responses suitable for public consumption.

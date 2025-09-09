@@ -94,4 +94,5 @@ func RegisterPublic(e *echo.Echo, p *handler.PublicHandler) {
     // choosing a show.  Use the optional ?active=true|false query parameter to
     // filter by a seat's is_active flag.
     e.GET("/v1/halls/:id/seats", p.GetPublicHallSeats)
+	e.GET("/v1/search/shows", p.SearchShows)
 }
