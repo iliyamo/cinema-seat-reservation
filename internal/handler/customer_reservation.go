@@ -46,12 +46,15 @@ func NewCustomerHandler(seatRepo *repository.SeatRepo, showRepo *repository.Show
 }
 
 // HoldSeats handles POST /v1/shows/:id/hold.  It allows a customer to
-// temporarily hold one or more seats for five minutes.  The request body
-// must contain a JSON object with a "seat_ids" array of positive
-// integers.  It returns a 201 Created response with the expiration
-// timestamp when successful.  If any requested seat is not available
-// (already reserved or held by another user) it returns 400 with an
-// error message and the list of unavailable seat IDs.
+// temporarily hold one or more seats for five minutes.  To prevent
+// race conditions when multiple users attempt to hold the same seat
+// concurrently, this handler uses row‑level locks on show_seats via
+// SELECT ... FOR UPDATE.  Each requested seat is locked and its
+// current status checked; only seats with status FREE and no active
+// seat_holds are holdable.  If a seat is RESERVED or already HELD,
+// the handler rejects the request and returns the unavailable seat IDs.
+// On success it inserts seat_holds records, updates show_seats.status
+// to HELD and commits the transaction, releasing the locks.
 func (h *CustomerHandler) HoldSeats(c echo.Context) error {
 	userID, err := getUserID(c)
 	if err != nil {
@@ -116,50 +119,100 @@ func (h *CustomerHandler) HoldSeats(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to cleanup expired holds"})
 		}
 	}
-	// filter holdable seats within transaction
-	holdable, err := h.ShowSeatRepo.FilterHoldableSeatsTx(ctx, tx, showID, unique)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to check seat availability"})
-	}
-	if len(holdable) != len(unique) {
-		// find unavailable seats by comparing
-		unavailable := make([]uint64, 0, len(unique)-len(holdable))
-		allowed := make(map[uint64]struct{})
-		for _, id := range holdable {
-			allowed[id] = struct{}{}
-		}
-		for _, id := range unique {
-			if _, ok := allowed[id]; !ok {
-				unavailable = append(unavailable, id)
-			}
-		}
-		return c.JSON(http.StatusBadRequest, echo.Map{
-			"error":       "some seats are unavailable",
-			"unavailable": unavailable,
-		})
-	}
-	// compute expiration 5 minutes from now
-	expiresAt := time.Now().UTC().Add(5 * time.Minute)
-	// generate hold records with random tokens
-	holds, err := repository.GenerateHoldRecords(userID, showID, holdable, expiresAt)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to generate hold tokens"})
-	}
-	if err := h.SeatHoldRepo.CreateMultipleTx(ctx, tx, holds); err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create holds"})
-	}
-	// update show_seats status to HELD
-	if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, holdable, "HELD"); err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
-	}
-	if err := tx.Commit(); err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
-	}
-	committed = true
-	return c.JSON(http.StatusCreated, echo.Map{
-		"expires_at": expiresAt.Format(time.RFC3339),
-		"seat_ids":   holdable,
-	})
+    // ------------------------------------------------------------------
+    // Use row‑level locks to safely check and hold seats.  Without locking
+    // concurrent requests could both see a seat as FREE and then both
+    // update it to HELD, resulting in double booking.  SELECT … FOR UPDATE
+    // locks the show_seats row until the transaction commits.
+    // We'll build two lists: holdable (available seats) and unavailable.
+    unavailable := make([]uint64, 0)
+    holdable := make([]uint64, 0, len(unique))
+    for _, sid := range unique {
+        // Acquire lock on the show_seats row for this seat.  This lock
+        // prevents other transactions from reading or updating the row
+        // until we decide whether it's free.  If the row is missing this
+        // scan will return sql.ErrNoRows which we treat as unavailable.
+        var seatStatus string
+        err := tx.QueryRowContext(ctx,
+            `SELECT status FROM show_seats WHERE show_id = ? AND seat_id = ? FOR UPDATE`,
+            showID, sid,
+        ).Scan(&seatStatus)
+        if err != nil {
+            // If the seat does not exist, treat it as unavailable
+            if errors.Is(err, sql.ErrNoRows) {
+                unavailable = append(unavailable, sid)
+                continue
+            }
+            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to lock seat"})
+        }
+        // Only seats with status FREE can be held.  RESERVED or HELD
+        // seats are considered unavailable.  Using row‑level lock ensures
+        // the status cannot change between this check and the update.
+        if seatStatus != "FREE" {
+            unavailable = append(unavailable, sid)
+            continue
+        }
+        // Check if there is an active hold on this seat by any user.
+        // Even if the show_seats.status is FREE, there may be an
+        // unexpired seat_hold record.  We do not append FOR UPDATE
+        // here because we already hold a lock on show_seats; counting
+        // seat_holds does not require locking rows as we won't update
+        // seat_holds until later.
+        var holdCount int
+        if err := tx.QueryRowContext(ctx,
+            `SELECT COUNT(*) FROM seat_holds WHERE show_id = ? AND seat_id = ? AND expires_at > UTC_TIMESTAMP()`,
+            showID, sid,
+        ).Scan(&holdCount); err != nil {
+            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to check active holds"})
+        }
+        if holdCount > 0 {
+            unavailable = append(unavailable, sid)
+            continue
+        }
+        // Seat is free and not held; mark as holdable.  We keep the
+        // row lock until the transaction commits to prevent others from
+        // grabbing it concurrently.
+        holdable = append(holdable, sid)
+    }
+    // If any seats are unavailable, abort the operation and return
+    // them to the client.  The unavailable slice lists seats that are
+    // either already HELD/RESERVED or missing.  We do not commit the
+    // transaction in this case; the deferred rollback will release locks.
+    if len(unavailable) > 0 {
+        return c.JSON(http.StatusBadRequest, echo.Map{
+            "error":       "some seats are unavailable",
+            "unavailable": unavailable,
+        })
+    }
+    // At this point we have locked all requested seats and verified
+    // they are free.  Generate hold records with a 5 minute expiration.
+    expiresAt := time.Now().UTC().Add(5 * time.Minute)
+    holds, err := repository.GenerateHoldRecords(userID, showID, holdable, expiresAt)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to generate hold tokens"})
+    }
+    // Insert seat_holds rows.  This does not conflict with the locked
+    // show_seats rows because we do not lock seat_holds when reading.
+    if err := h.SeatHoldRepo.CreateMultipleTx(ctx, tx, holds); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create holds"})
+    }
+    // Update show_seats.status to HELD for each seat.  Because we still
+    // hold the row locks from the earlier SELECT ... FOR UPDATE, this
+    // update cannot conflict with another transaction.  The status and
+    // version columns are updated atomically.
+    if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, holdable, "HELD"); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
+    }
+    // Commit the transaction.  This releases all row locks and makes
+    // the holds visible to other transactions.
+    if err := tx.Commit(); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
+    }
+    committed = true
+    return c.JSON(http.StatusCreated, echo.Map{
+        "expires_at": expiresAt.Format(time.RFC3339),
+        "seat_ids":   holdable,
+    })
 }
 
 // ReleaseHolds handles DELETE /v1/shows/:id/hold.  It releases all holds for
@@ -205,12 +258,16 @@ func (h *CustomerHandler) ReleaseHolds(c echo.Context) error {
 	})
 }
 
-// ConfirmSeats handles POST /v1/shows/:id/confirm.  It finalises a hold and
-// creates a reservation.  The handler verifies that the user still has
-// active holds on seats for the show and that the holds have not
-// expired.  It then creates a reservation record, reservation_seats
-// entries, updates the show seat statuses to RESERVED and removes the
-// holds.  Returns 201 Created with the reservation ID and total price.
+// ConfirmSeats (also mapped to POST /v1/shows/:id/reserve) finalises
+// previously held seats into a confirmed reservation.  To prevent
+// race conditions with concurrent reservations, it acquires row‑level
+// locks on each selected show_seats row via SELECT ... FOR UPDATE.
+// This ensures that the seat remains HELD by the current user until the
+// transaction commits.  The handler verifies that the seat status is
+// HELD and that there is an active seat_hold for the user; if not it
+// aborts.  After validation it creates a reservation and associated
+// reservation_seats, updates show_seats.status to RESERVED and
+// deletes the seat_holds.  The locks are released upon commit.
 func (h *CustomerHandler) ConfirmSeats(c echo.Context) error {
 	userID, err := getUserID(c)
 	if err != nil {
@@ -250,71 +307,139 @@ func (h *CustomerHandler) ConfirmSeats(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to cleanup expired holds"})
 		}
 	}
-	// load active holds for user + show
-	holds, err := h.SeatHoldRepo.ActiveHoldsByUserAndShowTx(ctx, tx, userID, showID)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to load holds"})
-	}
-	if len(holds) == 0 {
-		return c.JSON(http.StatusBadRequest, echo.Map{"error": "no active holds for this show"})
-	}
-	// extract seat IDs from holds
-	seatIDs := make([]uint64, 0, len(holds))
-	for _, hld := range holds {
-		seatIDs = append(seatIDs, hld.SeatID)
-	}
-	// compute total price from show_seats
-	priceMap, err := h.ShowSeatRepo.GetPricesBySeatIDsTx(ctx, tx, showID, seatIDs)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to fetch seat prices"})
-	}
-	total := uint32(0)
-	for _, sid := range seatIDs {
-		if p, ok := priceMap[sid]; ok {
-			total += p
-		} else {
-			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "price not found for seat"})
-		}
-	}
-	// create reservation record
-	resRec := &repository.ReservationRecord{
-		UserID:           userID,
-		ShowID:           showID,
-		Status:           "CONFIRMED",
-		TotalAmountCents: total,
-	}
-	if err := h.ReservationRepo.CreateTx(ctx, tx, resRec); err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create reservation"})
-	}
-	// create reservation_seats entries
-	seats := make([]repository.ReservationSeatRecord, 0, len(seatIDs))
-	for _, sid := range seatIDs {
-		seats = append(seats, repository.ReservationSeatRecord{
-			ReservationID: resRec.ID,
-			ShowID:        showID,
-			SeatID:        sid,
-			PriceCents:    priceMap[sid],
-		})
-	}
-	if err := h.ReservationRepo.CreateSeatsBulkTx(ctx, tx, seats); err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create reservation seats"})
-	}
-	// update show seats to RESERVED
-	if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, seatIDs, "RESERVED"); err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
-	}
-	// delete holds for this user and show
-	if _, err := h.SeatHoldRepo.DeleteByUserAndShowTx(ctx, tx, userID, showID); err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to delete holds"})
-	}
-	if err := tx.Commit(); err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
-	}
-	committed = true
-	return c.JSON(http.StatusCreated, echo.Map{
-		"reservation_id":     resRec.ID,
-		"total_amount_cents": total,
-	})
+    // load active holds for user + show.  This fetches all seat_holds
+    // belonging to the current user that have not expired.  We will
+    // validate each hold individually under row‑level locks below.
+    holds, err := h.SeatHoldRepo.ActiveHoldsByUserAndShowTx(ctx, tx, userID, showID)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to load holds"})
+    }
+    if len(holds) == 0 {
+        return c.JSON(http.StatusBadRequest, echo.Map{"error": "no active holds for this show"})
+    }
+    // Build a set of held seat IDs for quick lookup and preserve order.
+    seatIDs := make([]uint64, 0, len(holds))
+    heldByUser := make(map[uint64]struct{})
+    for _, hld := range holds {
+        seatIDs = append(seatIDs, hld.SeatID)
+        heldByUser[hld.SeatID] = struct{}{}
+    }
+    // Use row‑level locks to ensure that each seat is still HELD by this
+    // user and has not been reserved or held by someone else in the
+    // meantime.  Without locking, concurrent confirmations could both
+    // see the seat as HELD and reserve it twice.  We track any seats
+    // failing validation in unavailable.
+    unavailable := make([]uint64, 0)
+    for _, sid := range seatIDs {
+        // Lock the show_seats row for this seat.  This prevents status
+        // changes until we commit.  If the row is missing, treat as
+        // unavailable.
+        var seatStatus string
+        if err := tx.QueryRowContext(ctx,
+            `SELECT status FROM show_seats WHERE show_id = ? AND seat_id = ? FOR UPDATE`,
+            showID, sid,
+        ).Scan(&seatStatus); err != nil {
+            if errors.Is(err, sql.ErrNoRows) {
+                unavailable = append(unavailable, sid)
+                continue
+            }
+            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to lock seat"})
+        }
+        // Seat must currently be HELD.  If it is FREE or RESERVED, the
+        // hold is invalid or has been overtaken by another transaction.
+        if seatStatus != "HELD" {
+            unavailable = append(unavailable, sid)
+            continue
+        }
+        // Verify the seat hold record still belongs to the user.  We
+        // query seat_holds to ensure there is exactly one active hold by
+        // this user for this seat.  Without this check, a seat could be
+        // held by another user but still have status HELD.
+        var cnt int
+        if err := tx.QueryRowContext(ctx,
+            `SELECT COUNT(*) FROM seat_holds WHERE show_id = ? AND seat_id = ? AND user_id = ? AND expires_at > UTC_TIMESTAMP()`,
+            showID, sid, userID,
+        ).Scan(&cnt); err != nil {
+            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to verify seat hold"})
+        }
+        if cnt == 0 {
+            unavailable = append(unavailable, sid)
+            continue
+        }
+    }
+    if len(unavailable) > 0 {
+        // One or more seats cannot be confirmed.  Abort without
+        // committing; rollback will release locks.  Return a 400 so
+        // the client knows which seats failed.  Removing holds or
+        // cleaning up is not performed here; clients may retry.
+        return c.JSON(http.StatusBadRequest, echo.Map{
+            "error":       "some seats cannot be confirmed",
+            "unavailable": unavailable,
+        })
+    }
+    // Compute total price from show_seats for the held seats.  We do
+    // this after locking to ensure consistent pricing.  If any seat is
+    // missing a price, return an error.  priceMap maps seat_id to price.
+    priceMap, err := h.ShowSeatRepo.GetPricesBySeatIDsTx(ctx, tx, showID, seatIDs)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to fetch seat prices"})
+    }
+    total := uint32(0)
+    for _, sid := range seatIDs {
+        if p, ok := priceMap[sid]; ok {
+            total += p
+        } else {
+            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "price not found for seat"})
+        }
+    }
+    // Insert the reservation record.  We set status to CONFIRMED as
+    // holds are turned into a final reservation.  The ID is
+    // auto‑generated by the database.
+    resRec := &repository.ReservationRecord{
+        UserID:           userID,
+        ShowID:           showID,
+        Status:           "CONFIRMED",
+        TotalAmountCents: total,
+    }
+    if err := h.ReservationRepo.CreateTx(ctx, tx, resRec); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create reservation"})
+    }
+    // Prepare reservation_seats entries for each seat.  These map the
+    // reservation to individual seats and their prices.
+    seats := make([]repository.ReservationSeatRecord, 0, len(seatIDs))
+    for _, sid := range seatIDs {
+        seats = append(seats, repository.ReservationSeatRecord{
+            ReservationID: resRec.ID,
+            ShowID:        showID,
+            SeatID:        sid,
+            PriceCents:    priceMap[sid],
+        })
+    }
+    if err := h.ReservationRepo.CreateSeatsBulkTx(ctx, tx, seats); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create reservation seats"})
+    }
+    // Update show_seats.status to RESERVED for all seats.  Because we
+    // still hold row‑level locks, no other transaction can change the
+    // status concurrently.  BulkUpdateStatusTx increments the version
+    // and updates updated_at.
+    if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, seatIDs, "RESERVED"); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
+    }
+    // Remove seat_holds for this user and show.  This frees the
+    // seat_holds rows and prevents duplicate confirmations.  We ignore
+    // the returned list of seat IDs here since we already know them.
+    if _, err := h.SeatHoldRepo.DeleteByUserAndShowTx(ctx, tx, userID, showID); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to delete holds"})
+    }
+    // Commit the transaction to persist all changes and release locks.
+    if err := tx.Commit(); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
+    }
+    committed = true
+    return c.JSON(http.StatusCreated, echo.Map{
+        "reservation_id":     resRec.ID,
+        "total_amount_cents": total,
+    })
 }
 
 // ListReservations handles GET /v1/my-reservations.  It returns all
