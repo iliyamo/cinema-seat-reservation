@@ -1,0 +1,17 @@
+version: '3.8'
+
+# This compose file defines a Redis service for local development and testing.
+# To run the API containerised, you can add a service for the Go application.
+
+services:
+  # Redis service used for rate limiting and HTTP response caching
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:

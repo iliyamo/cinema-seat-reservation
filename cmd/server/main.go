@@ -3,6 +3,7 @@ package main // declare the main package; entry point of the application
 import (
     "log" // log package for logging messages during startup and runtime
     "os"  // os provides functions for interacting with the environment and filesystem
+    // (time import removed; rate limiting now configured via middleware)
 
     "github.com/joho/godotenv" // godotenv loads environment variables from .env files
     "github.com/labstack/echo/v4" // echo is the web framework used to create the HTTP server
@@ -10,6 +11,7 @@ import (
     "github.com/iliyamo/cinema-seat-reservation/internal/config"     // import configuration loader
     "github.com/iliyamo/cinema-seat-reservation/internal/database"   // import database connection helper
     "github.com/iliyamo/cinema-seat-reservation/internal/handler"    // import handlers for business logic
+    "github.com/iliyamo/cinema-seat-reservation/internal/middleware" // import middleware for caching and rate limiting
     "github.com/iliyamo/cinema-seat-reservation/internal/repository" // import repositories for persistence
     "github.com/iliyamo/cinema-seat-reservation/internal/router"     // import router to register routes
 )
@@ -44,7 +46,22 @@ func main() {
     defer db.Close()                          // ensure the database connection is closed when main exits
     log.Println("db connected")               // log that the connection succeeded
 
-    e := echo.New()                           // create a new Echo instance which will serve HTTP requests
+    // Initialise Redis if available.  The client may be nil when
+    // Redis is not configured or unreachable.  Handlers will fall
+    // back to database operations in that case.
+    redisClient := config.NewRedisClient()
+    if redisClient != nil {
+        log.Println("redis connected")
+    } else {
+        log.Println("redis not available; caching and rate limiting disabled")
+    }
+
+    // Create a new Echo instance and apply global middleware for rate limiting and caching.
+    e := echo.New()
+    rateCfg := config.LoadRateLimitConfig()
+    cacheCfg := config.LoadCacheConfig()
+    e.Use(middleware.NewTokenBucket(rateCfg, redisClient))
+    e.Use(middleware.NewRedisCache(cacheCfg, redisClient))
     // register basic routes that do not require authentication
     router.RegisterRoutes(e)
 
@@ -75,6 +92,8 @@ func main() {
             SeatRepo:     sr,
             ShowSeatRepo: ssr,
             SeatHoldRepo: shr,
+            // assign Redis client for caching seat hold status
+            RedisClient: redisClient,
         }
         // register public routes before protected owner and customer routes
         router.RegisterPublic(e, publicH)
@@ -89,6 +108,8 @@ func main() {
         // construct the customer handler with required repositories.  It uses the same
         // seat hold and reservation repositories as the public handler
         customerH := handler.NewCustomerHandler(sr, shwr, ssr, shr, rr, hr, cr)
+        // assign Redis client on the customer handler so internal seat hold caching can be used
+        customerH.RedisClient = redisClient
         // register customer routes requiring JWT auth and CUSTOMER role
         router.RegisterCustomer(e, customerH, cfg.JWTSecret)
 
@@ -96,3 +117,5 @@ func main() {
     log.Printf("listening on %s (env=%s)", addr, cfg.Env) // log where the server is about to start
     log.Fatal(e.Start(addr))                   // start serving HTTP requests and exit if the server returns an error
 }
+
+//

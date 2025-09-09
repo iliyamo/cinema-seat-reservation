@@ -1,11 +1,16 @@
 package handler
 
 import (
-    "database/sql"   // for sentinel errors returned from repository
-    "errors"         // for errors.Is comparisons
-    "net/http"       // HTTP status codes
-    "strconv"        // parsing path parameters
-    "time"           // working with timestamps
+    "context"                      // context for redis operations
+    "database/sql"                 // for sentinel errors returned from repository
+    "encoding/json"                // encoding/decoding JSON for Redis values
+    "errors"                       // for errors.Is comparisons
+    "fmt"                          // for string formatting of Redis keys
+    "net/http"                     // HTTP status codes
+    "strconv"                      // parsing path parameters
+    "time"                         // working with timestamps
+
+    "github.com/redis/go-redis/v9" // Redis client (v9)
 
     "github.com/iliyamo/cinema-seat-reservation/internal/repository" // repository layer
     "github.com/labstack/echo/v4"                                    // Echo web framework
@@ -26,6 +31,27 @@ type CustomerHandler struct {
 	ReservationRepo *repository.ReservationRepo // access to reservations and reservation_seats
 	HallRepo        *repository.HallRepo        // access to halls for potential lookups
 	CinemaRepo      *repository.CinemaRepo      // access to cinemas for reservation listing
+
+    // RedisClient is an optional client used to cache seat hold
+    // information and perform rate limiting.  If nil, the handler
+    // gracefully falls back to database only logic.  This client is
+    // injected at application startup.  See internal/config/redis.go
+    // for details on how the client is constructed.
+    RedisClient *redis.Client
+
+    // RateLimitMaxTokens defines the maximum number of tokens in the
+    // token bucket used to rate‑limit hold requests.  Only relevant
+    // when RedisClient is non‑nil.
+    RateLimitMaxTokens int
+    // RateLimitRefillRate defines how many tokens are replenished per
+    // second.  A value of 1 means one token is added each second.  The
+    // maximum number of tokens is limited by RateLimitMaxTokens.
+    RateLimitRefillRate float64
+    // RateLimitTTL is the expiration duration applied to the rate
+    // limiting key.  It should exceed the time needed to fully
+    // replenish the bucket.  When the key expires, a fresh bucket is
+    // created on the next request.
+    RateLimitTTL time.Duration
 }
 
 // NewCustomerHandler constructs a new CustomerHandler with the provided
@@ -42,7 +68,101 @@ func NewCustomerHandler(seatRepo *repository.SeatRepo, showRepo *repository.Show
 		ReservationRepo: reservationRepo,
 		HallRepo:        hallRepo,
 		CinemaRepo:      cinemaRepo,
+        // RedisClient and rate limit parameters are set externally after
+        // construction.  They default to nil and zero values here.
+        RedisClient:      nil,
+        RateLimitMaxTokens: 0,
+        RateLimitRefillRate: 0,
+        RateLimitTTL:       0,
 	}
+}
+
+// allowHold implements a token bucket rate limiter using Redis.  Each
+// user has a dedicated key "rate:<user_id>" storing the number of
+// available tokens and the timestamp of the last refill.  When a
+// request arrives, tokens are replenished based on the time elapsed
+// since the last refill (up to the configured maximum).  If at least
+// one token is available it is consumed and the request is allowed.
+// Otherwise the request is rejected.  The key TTL is refreshed on
+// each update to allow the bucket to expire after a period of
+// inactivity.  If RedisClient is nil or a Redis operation fails,
+// allowHold returns true to fallback to unlimited access.  The
+// implementation uses WATCH/MULTI to ensure atomic updates under
+// concurrent access.
+func (h *CustomerHandler) allowHold(ctx context.Context, userID uint64) (bool, error) {
+    // If no Redis client is configured, always allow.
+    if h.RedisClient == nil {
+        return true, nil
+    }
+    // Ensure rate limit parameters are sane; if not configured, allow.
+    if h.RateLimitMaxTokens <= 0 || h.RateLimitRefillRate <= 0 {
+        return true, nil
+    }
+    key := fmt.Sprintf("rate:%d", userID)
+    // We'll retry if a concurrent update causes the transaction to fail.
+    for {
+        err := h.RedisClient.Watch(ctx, func(tx *redis.Tx) error {
+            // Attempt to get the current state.
+            data, err := tx.Get(ctx, key).Bytes()
+            // Default values for a new bucket.
+            tokens := float64(h.RateLimitMaxTokens)
+            lastRefill := float64(time.Now().Unix())
+            if err == nil {
+                // Attempt to parse existing JSON value.
+                var state struct {
+                    Tokens     float64 `json:"tokens"`
+                    LastRefill int64   `json:"last_refill"`
+                }
+                if uErr := json.Unmarshal(data, &state); uErr == nil {
+                    tokens = state.Tokens
+                    lastRefill = float64(state.LastRefill)
+                    // Refill tokens based on elapsed seconds.
+                    now := float64(time.Now().Unix())
+                    // Number of seconds since the last refill.
+                    diff := now - lastRefill
+                    if diff > 0 {
+                        tokens += diff * h.RateLimitRefillRate
+                        if tokens > float64(h.RateLimitMaxTokens) {
+                            tokens = float64(h.RateLimitMaxTokens)
+                        }
+                        lastRefill = now
+                    }
+                }
+                // If JSON unmarshal fails, treat as new bucket.
+            } else if err != redis.Nil {
+                // Unexpected error retrieving the key; fallback to allow.
+                return err
+            }
+            // Check if we have a token to consume.
+            if tokens < 1.0 {
+                // Reject by returning a sentinel error that will break out of the watch.
+                return redis.TxFailedErr
+            }
+            // Consume one token.
+            tokens -= 1.0
+            // Marshal the updated state back to JSON.
+            newState, _ := json.Marshal(struct {
+                Tokens     float64 `json:"tokens"`
+                LastRefill int64   `json:"last_refill"`
+            }{tokens, int64(lastRefill)})
+            // Execute the transaction to update the key with the new state and TTL.
+            _, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+                pipe.Set(ctx, key, newState, h.RateLimitTTL)
+                return nil
+            })
+            return err
+        }, key)
+        if err == nil {
+            // Transaction committed successfully; request is allowed.
+            return true, nil
+        }
+        if errors.Is(err, redis.TxFailedErr) {
+            // Token was not available; reject request.
+            return false, nil
+        }
+        // On other errors, fallback to allowing the request.
+        return true, nil
+    }
 }
 
 // HoldSeats handles POST /v1/shows/:id/hold.  It allows a customer to
@@ -209,6 +329,23 @@ func (h *CustomerHandler) HoldSeats(c echo.Context) error {
         return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
     }
     committed = true
+    // After the transaction commits, cache hold information in Redis so
+    // that seat status can be determined without querying the
+    // database.  Each seat receives a key with TTL equal to the hold
+    // duration.  If RedisClient is nil or an error occurs, we ignore
+    // the error and rely solely on the database status.  The
+    // information stored includes the user ID and expiration time.
+    if h.RedisClient != nil && len(holdable) > 0 {
+        ttl := time.Until(expiresAt)
+        for _, sid := range holdable {
+            key := fmt.Sprintf("hold:%d:%d", showID, sid)
+            val, _ := json.Marshal(struct {
+                UserID    uint64 `json:"user_id"`
+                ExpiresAt string `json:"expires_at"`
+            }{userID, expiresAt.Format(time.RFC3339)})
+            _ = h.RedisClient.Set(ctx, key, val, ttl).Err()
+        }
+    }
     return c.JSON(http.StatusCreated, echo.Map{
         "expires_at": expiresAt.Format(time.RFC3339),
         "seat_ids":   holdable,
@@ -249,13 +386,20 @@ func (h *CustomerHandler) ReleaseHolds(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
-	}
-	committed = true
-	return c.JSON(http.StatusOK, echo.Map{
-		"released": len(seatIDs),
-	})
+    if err := tx.Commit(); err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
+    }
+    committed = true
+    // Remove cached hold keys from Redis now that the holds are released.
+    if h.RedisClient != nil && len(seatIDs) > 0 {
+        for _, sid := range seatIDs {
+            key := fmt.Sprintf("hold:%d:%d", showID, sid)
+            _ = h.RedisClient.Del(ctx, key).Err()
+        }
+    }
+    return c.JSON(http.StatusOK, echo.Map{
+        "released": len(seatIDs),
+    })
 }
 
 // ConfirmSeats (also mapped to POST /v1/shows/:id/reserve) finalises
@@ -436,6 +580,13 @@ func (h *CustomerHandler) ConfirmSeats(c echo.Context) error {
         return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
     }
     committed = true
+    // Delete cached hold keys in Redis now that the seats are confirmed.
+    if h.RedisClient != nil {
+        for _, sid := range seatIDs {
+            key := fmt.Sprintf("hold:%d:%d", showID, sid)
+            _ = h.RedisClient.Del(ctx, key).Err()
+        }
+    }
     return c.JSON(http.StatusCreated, echo.Map{
         "reservation_id":     resRec.ID,
         "total_amount_cents": total,
@@ -477,6 +628,16 @@ func (h *CustomerHandler) GetReservation(c echo.Context) error {
         return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid reservation id"})
     }
     ctx := c.Request().Context()
+
+    // Apply rate limiting before starting a DB transaction.  This uses a
+    // token bucket implemented in Redis to prevent abuse of the hold
+    // endpoint.  If the user has exhausted their quota, respond with
+    // HTTP 429.  Any error from allowHold is ignored and we proceed.
+    if ok, errRate := h.allowHold(ctx, userID); errRate == nil {
+        if !ok {
+            return c.JSON(http.StatusTooManyRequests, echo.Map{"error": "too many requests"})
+        }
+    }
     detail, err := h.ReservationRepo.GetByIDForUser(ctx, resID, userID)
     if err != nil {
         if errors.Is(err, sql.ErrNoRows) {

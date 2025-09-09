@@ -7,11 +7,14 @@
 package handler
 
 import (
-    "net/http"  // HTTP status codes and request context
-    "strconv"   // string to integer conversion utilities
-    "strings"   // trimming and other string helpers
-    "time"      // parsing and formatting timestamps
-    "sort"      // sorting helpers for row labels
+    "net/http"                                    // HTTP status codes and request context
+    "strconv"                                     // string to integer conversion utilities
+    "strings"                                     // trimming and other string helpers
+    "time"                                        // parsing and formatting timestamps
+    "sort"                                        // sorting helpers for row labels
+    "fmt"                                         // formatting Redis keys
+
+    "github.com/redis/go-redis/v9"                // Redis client (v9)
 
     "github.com/labstack/echo/v4"                         // Echo web framework
     "github.com/iliyamo/cinema-seat-reservation/internal/repository" // repository interfaces
@@ -35,6 +38,12 @@ type PublicHandler struct {
     // computing seat status.  It may be nil in legacy constructions; when
     // non-nil it will be used to expire holds before listing seats.
     SeatHoldRepo *repository.SeatHoldRepo
+
+    // RedisClient optionally provides access to a Redis server for
+    // caching seat hold information.  When set, GetPublicShowSeats
+    // will consult Redis for active holds before reading from the
+    // database.  If nil, the handler relies solely on the database.
+    RedisClient *redis.Client
 }
 
 // PublicCinema represents a cinema exposed via the public API. It contains
@@ -364,7 +373,12 @@ func (h *PublicHandler) GetPublicShowSeats(c echo.Context) error {
     if err != nil {
         return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
     }
-    // build response items
+    // Build response items.  If Redis is configured, consult it for
+    // active seat holds.  A Redis hold key overrides the database
+    // status and sets the status to HELD.  Redis operations are
+    // performed with the same request context so they can be cancelled
+    // if the request times out.  If a Redis error occurs (other than
+    // key not found), we ignore it and fall back to the DB status.
     type seatOut struct {
         SeatID     uint64 `json:"seat_id"`
         RowLabel   string `json:"row_label"`
@@ -373,7 +387,15 @@ func (h *PublicHandler) GetPublicShowSeats(c echo.Context) error {
     }
     items := make([]seatOut, 0, len(seats))
     for _, s := range seats {
-        items = append(items, seatOut{SeatID: s.SeatID, RowLabel: s.RowLabel, SeatNumber: s.SeatNumber, Status: s.Status})
+        status := s.Status
+        if h.RedisClient != nil {
+            key := fmt.Sprintf("hold:%d:%d", showID, s.SeatID)
+            // Use Exists to check for a hold.  Returns the number of keys existing (0 or 1).
+            if exists, err := h.RedisClient.Exists(ctx, key).Result(); err == nil && exists > 0 {
+                status = "HELD"
+            }
+        }
+        items = append(items, seatOut{SeatID: s.SeatID, RowLabel: s.RowLabel, SeatNumber: s.SeatNumber, Status: status})
     }
     return c.JSON(http.StatusOK, echo.Map{
         "show_id": showID,
