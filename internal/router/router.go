@@ -87,4 +87,11 @@ func RegisterPublic(e *echo.Echo, p *handler.PublicHandler) {
     // Publicly view seat availability for a specific show.  Seat status is derived from show seats and active holds.
     // Status values can be FREE, HELD or RESERVED.
     e.GET("/v1/shows/:id/seats", p.GetPublicShowSeats)
+
+    // Publicly view the list of all seats in a hall (flat list).  This route returns
+    // a simple array of seats with row labels, numbers, types and active flags.  No
+    // authentication is required so that guests can inspect a hall's seats before
+    // choosing a show.  Use the optional ?active=true|false query parameter to
+    // filter by a seat's is_active flag.
+    e.GET("/v1/halls/:id/seats", p.GetPublicHallSeats)
 }

@@ -381,3 +381,71 @@ func (h *PublicHandler) GetPublicShowSeats(c echo.Context) error {
         "items":   items,
     })
 }
+
+// GetPublicHallSeats handles GET /v1/halls/:id/seats for unauthenticated users.
+// It returns a flat list of seats for the given hall.  Each seat entry contains
+// the seat_id, row_label, seat_number, seat_type and is_active flag.  An
+// optional query parameter "active" may be supplied to filter results by the
+// seat's activation status (true or false).  This endpoint does not require
+// authentication and allows guests to inspect the hall's seats before
+// selecting a show.
+func (h *PublicHandler) GetPublicHallSeats(c echo.Context) error {
+    // Ensure the seat repository is configured; without it we cannot list seats.
+    if h.SeatRepo == nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "seat repository not configured"})
+    }
+    ctx := c.Request().Context()
+    hallID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+    if err != nil || hallID == 0 {
+        return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid id"})
+    }
+    // Ensure the hall exists before querying its seats.  We do not expose
+    // internal errors to clients but return 404 if the hall is not found.
+    if _, err := h.HallRepo.GetByID(ctx, hallID); err != nil {
+        if err == repository.ErrHallNotFound {
+            return c.JSON(http.StatusNotFound, echo.Map{"error": "hall not found"})
+        }
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
+    }
+    // Fetch all seats for this hall ordered by row and number.
+    seats, err := h.SeatRepo.GetByHall(ctx, hallID)
+    if err != nil {
+        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
+    }
+    // Optionally filter by the "active" query parameter.  Accepts true/false or 1/0.
+    if v := strings.ToLower(strings.TrimSpace(c.QueryParam("active"))); v == "true" || v == "1" || v == "false" || v == "0" {
+        want := v == "true" || v == "1"
+        filtered := make([]repository.Seat, 0, len(seats))
+        for _, s := range seats {
+            if s.IsActive == want {
+                filtered = append(filtered, s)
+            }
+        }
+        seats = filtered
+    }
+    // Build the response items.  We include the seat type and active flag so
+    // clients can identify special seats (e.g. VIP, ACCESSIBLE) and current
+    // availability status (soft availability, not reservation status).
+    type seatOut struct {
+        SeatID     uint64 `json:"seat_id"`
+        RowLabel   string `json:"row_label"`
+        SeatNumber uint32 `json:"seat_number"`
+        SeatType   string `json:"seat_type"`
+        IsActive   bool   `json:"is_active"`
+    }
+    items := make([]seatOut, 0, len(seats))
+    for _, s := range seats {
+        items = append(items, seatOut{
+            SeatID:     s.ID,
+            RowLabel:   s.RowLabel,
+            SeatNumber: s.SeatNumber,
+            SeatType:   s.SeatType,
+            IsActive:   s.IsActive,
+        })
+    }
+    return c.JSON(http.StatusOK, echo.Map{
+        "hall_id": hallID,
+        "count":   len(items),
+        "items":   items,
+    })
+}

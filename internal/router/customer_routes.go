@@ -16,9 +16,10 @@ func RegisterCustomer(e *echo.Echo, h *handler.CustomerHandler, jwtSecret string
         middleware.JWTAuth(jwtSecret),
         middleware.RequireRole("CUSTOMER"),
     )
-    // Note: GET /v1/shows/:id/seats and GET /v1/halls/:id/seats/layout are
-    // registered on the public router so that guests can view seat
-    // availability.  Customer-specific endpoints begin here.
+    // Note: GET /v1/shows/:id/seats, GET /v1/halls/:id/seats/layout and
+    // GET /v1/halls/:id/seats are registered on the public router so that
+    // guests can view seat availability and hall seat lists.  Customer-specific
+    // endpoints begin here.
     g.POST("/shows/:id/hold", h.HoldSeats)
     g.DELETE("/shows/:id/hold", h.ReleaseHolds)
     g.POST("/shows/:id/confirm", h.ConfirmSeats)
