@@ -1,5 +1,6 @@
 package repository
 
+
 import (
     "context"
     "database/sql"
@@ -15,6 +16,17 @@ import (
 type ReservationRepo struct {
     db *sql.DB
 }
+
+// NOTE: This file has been modified to fix several issues related to
+// reservation deletion and timestamp handling.  Specifically:
+// * Timestamps are now scanned using sql.NullTime instead of sql.NullString.
+//   This prevents parse errors that previously resulted in HTTP 500s when
+//   deleting reservations or listing reservations.  Valid times are
+//   formatted as RFC3339 in UTC; NULL values leave the JSON fields
+//   unset.
+// * GetInfoForOwnerTx and GetInfoForUserTx now scan the show's start time
+//   directly into a time.Time rather than as a string.  This avoids
+//   parsing errors and ensures the returned time is in UTC.
 
 // NewReservationRepo returns a new ReservationRepo bound to the given database.
 func NewReservationRepo(db *sql.DB) *ReservationRepo { return &ReservationRepo{db: db} }
@@ -168,28 +180,27 @@ func (r *ReservationRepo) GetByIDForUser(ctx context.Context, reservationID, use
     var hallName string
     var cinemaID sql.NullInt64
     var cinemaName sql.NullString
-    var startStr, endStr sql.NullString
+    // Use sql.NullTime instead of sql.NullString for start and end times.  This
+    // avoids manual parsing and properly handles NULL values from the database.
+    var startTime, endTime sql.NullTime
     // Execute the query; if no row is returned the error is sql.ErrNoRows
     err := r.db.QueryRowContext(ctx, q, reservationID, userID).Scan(
         &det.ID, &det.ShowID, &det.Status, &det.TotalAmountCents,
-        &det.ShowTitle, &startStr, &endStr,
+        &det.ShowTitle, &startTime, &endTime,
         &hallID, &hallName, &cinemaID, &cinemaName,
     )
     if err != nil {
         return nil, err
     }
-    // Convert DB timestamps (YYYY‑MM‑DD HH:MM:SS) to RFC3339 in UTC
-    if startStr.Valid && strings.TrimSpace(startStr.String) != "" && startStr.String != "0001-01-01 00:00:00" {
-        if t, err2 := time.Parse("2006-01-02 15:04:05", startStr.String); err2 == nil {
-            iso := t.UTC().Format(time.RFC3339)
-            det.StartTime = &iso
-        }
+    // Convert start and end times to RFC3339 in UTC.  When the database
+    // value is NULL (sql.NullTime.Valid == false), leave the JSON fields unset.
+    if startTime.Valid {
+        iso := startTime.Time.UTC().Format(time.RFC3339)
+        det.StartTime = &iso
     }
-    if endStr.Valid && strings.TrimSpace(endStr.String) != "" && endStr.String != "0001-01-01 00:00:00" {
-        if t, err2 := time.Parse("2006-01-02 15:04:05", endStr.String); err2 == nil {
-            iso := t.UTC().Format(time.RFC3339)
-            det.EndTime = &iso
-        }
+    if endTime.Valid {
+        iso := endTime.Time.UTC().Format(time.RFC3339)
+        det.EndTime = &iso
     }
     det.HallID = hallID
     det.HallName = hallName
@@ -277,10 +288,11 @@ func (r *ReservationRepo) GetByIDForOwner(ctx context.Context, reservationID, ow
     var hallName string
     var cinemaID sql.NullInt64
     var cinemaName sql.NullString
-    var startStr, endStr sql.NullString
+    // Scan start and end times as sql.NullTime to avoid manual parsing
+    var startTime, endTime sql.NullTime
     if err := r.db.QueryRowContext(ctx, q, reservationID).Scan(
         &det.ID, &det.UserID, &det.ShowID, &det.Status, &det.TotalAmountCents, &payRef,
-        &det.ShowTitle, &startStr, &endStr,
+        &det.ShowTitle, &startTime, &endTime,
         &hallID, &hallName, &cinemaID, &cinemaName,
     ); err != nil {
         return nil, err
@@ -289,18 +301,14 @@ func (r *ReservationRepo) GetByIDForOwner(ctx context.Context, reservationID, ow
         ref := payRef.String
         det.PaymentRef = &ref
     }
-    // Convert times
-    if startStr.Valid && strings.TrimSpace(startStr.String) != "" && startStr.String != "0001-01-01 00:00:00" {
-        if t, err2 := time.Parse("2006-01-02 15:04:05", startStr.String); err2 == nil {
-            iso := t.UTC().Format(time.RFC3339)
-            det.StartTime = &iso
-        }
+    // Convert times to RFC3339 in UTC.  NULL values result in nil JSON fields.
+    if startTime.Valid {
+        iso := startTime.Time.UTC().Format(time.RFC3339)
+        det.StartTime = &iso
     }
-    if endStr.Valid && strings.TrimSpace(endStr.String) != "" && endStr.String != "0001-01-01 00:00:00" {
-        if t, err2 := time.Parse("2006-01-02 15:04:05", endStr.String); err2 == nil {
-            iso := t.UTC().Format(time.RFC3339)
-            det.EndTime = &iso
-        }
+    if endTime.Valid {
+        iso := endTime.Time.UTC().Format(time.RFC3339)
+        det.EndTime = &iso
     }
     det.HallID = hallID
     det.HallName = hallName
@@ -393,11 +401,12 @@ func (r *ReservationRepo) ListByShowForOwner(ctx context.Context, showID, ownerI
         var hallName string
         var cinemaID sql.NullInt64
         var cinemaName sql.NullString
-        var startStr, endStr sql.NullString
+        // Scan start and end times as sql.NullTime
+        var startTime, endTime sql.NullTime
         var createdAt time.Time
         if err := rows.Scan(
             &d.ID, &d.UserID, &d.ShowID, &d.Status, &d.TotalAmountCents, &payRef,
-            &d.ShowTitle, &startStr, &endStr,
+            &d.ShowTitle, &startTime, &endTime,
             &hallID, &hallName, &cinemaID, &cinemaName,
             &createdAt,
         ); err != nil {
@@ -407,18 +416,14 @@ func (r *ReservationRepo) ListByShowForOwner(ctx context.Context, showID, ownerI
             ref := payRef.String
             d.PaymentRef = &ref
         }
-        // parse start and end times to RFC3339
-        if startStr.Valid && strings.TrimSpace(startStr.String) != "" && startStr.String != "0001-01-01 00:00:00" {
-            if t, err2 := time.Parse("2006-01-02 15:04:05", startStr.String); err2 == nil {
-                iso := t.UTC().Format(time.RFC3339)
-                d.StartTime = &iso
-            }
+        // Convert start and end times to RFC3339 in UTC if present
+        if startTime.Valid {
+            iso := startTime.Time.UTC().Format(time.RFC3339)
+            d.StartTime = &iso
         }
-        if endStr.Valid && strings.TrimSpace(endStr.String) != "" && endStr.String != "0001-01-01 00:00:00" {
-            if t, err2 := time.Parse("2006-01-02 15:04:05", endStr.String); err2 == nil {
-                iso := t.UTC().Format(time.RFC3339)
-                d.EndTime = &iso
-            }
+        if endTime.Valid {
+            iso := endTime.Time.UTC().Format(time.RFC3339)
+            d.EndTime = &iso
         }
         d.HallID = hallID
         d.HallName = hallName
@@ -498,20 +503,19 @@ func (r *ReservationRepo) GetInfoForOwnerTx(ctx context.Context, tx *sql.Tx, res
                JOIN halls h ON h.id = s.hall_id
                WHERE r.id = ?`
     var showID uint64
-    var startStr string
+    // Scan the show's start time directly as a time.Time rather than a string to
+    // avoid parsing errors.  The shows.starts_at column is defined as
+    // DATETIME NOT NULL, so this will always return a valid time.
+    var startTime time.Time
     var actualOwnerID uint64
-    err := tx.QueryRowContext(ctx, q, reservationID).Scan(&showID, &startStr, &actualOwnerID)
+    err := tx.QueryRowContext(ctx, q, reservationID).Scan(&showID, &startTime, &actualOwnerID)
     if err != nil {
         return 0, time.Time{}, nil, err
     }
     if actualOwnerID != ownerID {
         return 0, time.Time{}, nil, ErrForbidden
     }
-    // Parse start time
-    t, err := time.Parse("2006-01-02 15:04:05", startStr)
-    if err != nil {
-        return 0, time.Time{}, nil, err
-    }
+    // No parsing necessary; startTime already contains the correct value
     // Fetch seat IDs
     const seatQ = `SELECT seat_id FROM reservation_seats WHERE reservation_id = ?`
     rows, err := tx.QueryContext(ctx, seatQ, reservationID)
@@ -530,7 +534,7 @@ func (r *ReservationRepo) GetInfoForOwnerTx(ctx context.Context, tx *sql.Tx, res
     if err := rows.Err(); err != nil {
         return 0, time.Time{}, nil, err
     }
-    return showID, t.UTC(), seatIDs, nil
+    return showID, startTime.UTC(), seatIDs, nil
 }
 
 // GetInfoForUserTx returns the show ID, show start time and seat IDs for a
@@ -544,19 +548,17 @@ func (r *ReservationRepo) GetInfoForUserTx(ctx context.Context, tx *sql.Tx, rese
                JOIN shows s ON s.id = r.show_id
                WHERE r.id = ?`
     var showID uint64
-    var startStr string
+    // Scan the show's start time directly as a time.Time to avoid parsing errors.
+    var startTime time.Time
     var actualUserID uint64
-    err := tx.QueryRowContext(ctx, q, reservationID).Scan(&showID, &startStr, &actualUserID)
+    err := tx.QueryRowContext(ctx, q, reservationID).Scan(&showID, &startTime, &actualUserID)
     if err != nil {
         return 0, time.Time{}, nil, err
     }
     if actualUserID != userID {
         return 0, time.Time{}, nil, ErrForbidden
     }
-    t, err := time.Parse("2006-01-02 15:04:05", startStr)
-    if err != nil {
-        return 0, time.Time{}, nil, err
-    }
+    // No parsing necessary; startTime already contains the correct value
     const seatQ = `SELECT seat_id FROM reservation_seats WHERE reservation_id = ?`
     rows, err := tx.QueryContext(ctx, seatQ, reservationID)
     if err != nil {
@@ -574,7 +576,7 @@ func (r *ReservationRepo) GetInfoForUserTx(ctx context.Context, tx *sql.Tx, rese
     if err := rows.Err(); err != nil {
         return 0, time.Time{}, nil, err
     }
-    return showID, t.UTC(), seatIDs, nil
+    return showID, startTime.UTC(), seatIDs, nil
 }
 
 // ListByUser returns all reservations for the given user along with show,
@@ -609,28 +611,25 @@ func (r *ReservationRepo) ListByUser(ctx context.Context, userID uint64) ([]Rese
         var hallName string
         var cinemaID sql.NullInt64
         var cinemaName sql.NullString
-        var startStr, endStr sql.NullString
+        // Scan start and end times as sql.NullTime to avoid parsing errors
+        var startTime, endTime sql.NullTime
         var createdAt time.Time
         if err := rows.Scan(
             &d.ID, &d.ShowID, &d.Status, &d.TotalAmountCents,
-            &d.ShowTitle, &startStr, &endStr,
+            &d.ShowTitle, &startTime, &endTime,
             &hallID, &hallName, &cinemaID, &cinemaName,
             &createdAt,
         ); err != nil {
             return nil, err
         }
-        // Convert times from DB format to ISO8601
-        if startStr.Valid && strings.TrimSpace(startStr.String) != "" && startStr.String != "0001-01-01 00:00:00" {
-            if t, err2 := time.Parse("2006-01-02 15:04:05", startStr.String); err2 == nil {
-                iso := t.UTC().Format(time.RFC3339)
-                d.StartTime = &iso
-            }
+        // Convert times from DB to RFC3339 in UTC.  Leave unset when NULL.
+        if startTime.Valid {
+            iso := startTime.Time.UTC().Format(time.RFC3339)
+            d.StartTime = &iso
         }
-        if endStr.Valid && strings.TrimSpace(endStr.String) != "" && endStr.String != "0001-01-01 00:00:00" {
-            if t, err2 := time.Parse("2006-01-02 15:04:05", endStr.String); err2 == nil {
-                iso := t.UTC().Format(time.RFC3339)
-                d.EndTime = &iso
-            }
+        if endTime.Valid {
+            iso := endTime.Time.UTC().Format(time.RFC3339)
+            d.EndTime = &iso
         }
         d.HallID = hallID
         d.HallName = hallName

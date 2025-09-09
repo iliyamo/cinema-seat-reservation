@@ -61,13 +61,22 @@ func (h *OwnerReservationHandler) ListShowReservations(c echo.Context) error {
     ctx := c.Request().Context()
     details, err := h.ReservationRepo.ListByShowForOwner(ctx, showID, ownerID)
     if err != nil {
+        // If the show does not exist, the repository will return sql.ErrNoRows.
+        // Surface that as a 404 to the client.  A forbidden error indicates that
+        // the show exists but belongs to a different owner.
+        if errors.Is(err, sql.ErrNoRows) {
+            return c.JSON(http.StatusNotFound, echo.Map{"error": "show not found"})
+        }
         if errors.Is(err, repository.ErrForbidden) {
             return c.JSON(http.StatusForbidden, echo.Map{"error": "forbidden"})
         }
         return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to load reservations"})
     }
+    // Always return a count and items.  When no reservations exist, details will
+    // be an empty slice and count will be zero.
     return c.JSON(http.StatusOK, echo.Map{
         "items": details,
+        "count": len(details),
     })
 }
 
