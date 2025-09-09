@@ -24,4 +24,11 @@ func RegisterCustomer(e *echo.Echo, h *handler.CustomerHandler, jwtSecret string
     g.DELETE("/shows/:id/hold", h.ReleaseHolds)
     g.POST("/shows/:id/confirm", h.ConfirmSeats)
     g.GET("/my-reservations", h.ListReservations)
+
+    // Reservation detail and deletion endpoints for customers.  These
+    // endpoints allow a customer to view or cancel a reservation
+    // belonging to themselves.  They are protected by the CUSTOMER
+    // role and validated within the handler.
+    g.GET("/reservations/:id", h.GetReservation)
+    g.DELETE("/reservations/:id", h.DeleteReservation)
 }

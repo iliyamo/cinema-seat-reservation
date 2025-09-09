@@ -82,6 +82,9 @@ func main() {
         ownerH := handler.NewOwnerHandler(cr, hr, sr, shwr, ssr)
         // register owner routes requiring JWT auth and OWNER role
         router.RegisterOwner(e, ownerH, cfg.JWTSecret)
+        // construct reservation handler for owners and register owner reservation routes
+        ownerResH := handler.NewOwnerReservationHandler(rr, shwr, hr, ssr)
+        router.RegisterOwnerReservations(e, ownerResH, cfg.JWTSecret)
 
         // construct the customer handler with required repositories.  It uses the same
         // seat hold and reservation repositories as the public handler
