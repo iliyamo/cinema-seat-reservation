@@ -51,3 +51,27 @@ func (r *ShowSeatRepo) CreateBulk(ctx context.Context, seats []ShowSeat) error {
     _, err := r.db.ExecContext(ctx, query, args...)
     return err
 }
+
+// CreateBulkTx inserts multiple show_seat records within the scope of an existing
+// transaction.  This method mirrors CreateBulk but uses the provided *sql.Tx
+// instead of the repository's DB handle, allowing callers to compose
+// show_seat inserts with other operations in a single atomic transaction.
+// The caller is responsible for committing or rolling back the transaction.
+func (r *ShowSeatRepo) CreateBulkTx(ctx context.Context, tx *sql.Tx, seats []ShowSeat) error {
+    if len(seats) == 0 {
+        return nil
+    }
+    // Build the insert statement with one set of placeholders per seat.
+    query := `INSERT INTO show_seats (show_id, seat_id, status, price_cents, version) VALUES `
+    args := make([]interface{}, 0, len(seats)*5)
+    for i, ss := range seats {
+        if i > 0 {
+            query += ","
+        }
+        query += "(?, ?, ?, ?, ?)"
+        args = append(args, ss.ShowID, ss.SeatID, ss.Status, ss.PriceCents, ss.Version)
+    }
+    // Execute the bulk insert within the provided transaction context.
+    _, err := tx.ExecContext(ctx, query, args...)
+    return err
+}
