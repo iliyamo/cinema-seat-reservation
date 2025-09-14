@@ -1,19 +1,24 @@
 package handler
 
 import (
-    "context"                      // context for redis operations
-    "database/sql"                 // for sentinel errors returned from repository
-    "encoding/json"                // encoding/decoding JSON for Redis values
-    "errors"                       // for errors.Is comparisons
-    "fmt"                          // for string formatting of Redis keys
-    "net/http"                     // HTTP status codes
-    "strconv"                      // parsing path parameters
-    "time"                         // working with timestamps
+	"context"       // context for redis operations
+	"database/sql"  // for sentinel errors returned from repository
+	"encoding/json" // encoding/decoding JSON for Redis values
+	"errors"        // for errors.Is comparisons
+	"fmt"           // for string formatting of Redis keys
+	"net/http"      // HTTP status codes
+	"strconv"       // parsing path parameters
+	"time"          // working with timestamps
 
-    "github.com/redis/go-redis/v9" // Redis client (v9)
+	"log" // logging for event publishing errors
 
-    "github.com/iliyamo/cinema-seat-reservation/internal/repository" // repository layer
-    "github.com/labstack/echo/v4"                                    // Echo web framework
+	"github.com/redis/go-redis/v9" // Redis client (v9)
+
+	"github.com/iliyamo/cinema-seat-reservation/internal/repository" // repository layer
+	"github.com/labstack/echo/v4"                                    // Echo web framework
+
+	qevt "github.com/iliyamo/cinema-seat-reservation/internal/queue"
+	queue_publisher "github.com/iliyamo/cinema-seat-reservation/internal/service"
 )
 
 // CustomerHandler groups repositories required to perform seat holds,
@@ -32,26 +37,26 @@ type CustomerHandler struct {
 	HallRepo        *repository.HallRepo        // access to halls for potential lookups
 	CinemaRepo      *repository.CinemaRepo      // access to cinemas for reservation listing
 
-    // RedisClient is an optional client used to cache seat hold
-    // information and perform rate limiting.  If nil, the handler
-    // gracefully falls back to database only logic.  This client is
-    // injected at application startup.  See internal/config/redis.go
-    // for details on how the client is constructed.
-    RedisClient *redis.Client
+	// RedisClient is an optional client used to cache seat hold
+	// information and perform rate limiting.  If nil, the handler
+	// gracefully falls back to database only logic.  This client is
+	// injected at application startup.  See internal/config/redis.go
+	// for details on how the client is constructed.
+	RedisClient *redis.Client
 
-    // RateLimitMaxTokens defines the maximum number of tokens in the
-    // token bucket used to rate‑limit hold requests.  Only relevant
-    // when RedisClient is non‑nil.
-    RateLimitMaxTokens int
-    // RateLimitRefillRate defines how many tokens are replenished per
-    // second.  A value of 1 means one token is added each second.  The
-    // maximum number of tokens is limited by RateLimitMaxTokens.
-    RateLimitRefillRate float64
-    // RateLimitTTL is the expiration duration applied to the rate
-    // limiting key.  It should exceed the time needed to fully
-    // replenish the bucket.  When the key expires, a fresh bucket is
-    // created on the next request.
-    RateLimitTTL time.Duration
+	// RateLimitMaxTokens defines the maximum number of tokens in the
+	// token bucket used to rate‑limit hold requests.  Only relevant
+	// when RedisClient is non‑nil.
+	RateLimitMaxTokens int
+	// RateLimitRefillRate defines how many tokens are replenished per
+	// second.  A value of 1 means one token is added each second.  The
+	// maximum number of tokens is limited by RateLimitMaxTokens.
+	RateLimitRefillRate float64
+	// RateLimitTTL is the expiration duration applied to the rate
+	// limiting key.  It should exceed the time needed to fully
+	// replenish the bucket.  When the key expires, a fresh bucket is
+	// created on the next request.
+	RateLimitTTL time.Duration
 }
 
 // NewCustomerHandler constructs a new CustomerHandler with the provided
@@ -68,12 +73,12 @@ func NewCustomerHandler(seatRepo *repository.SeatRepo, showRepo *repository.Show
 		ReservationRepo: reservationRepo,
 		HallRepo:        hallRepo,
 		CinemaRepo:      cinemaRepo,
-        // RedisClient and rate limit parameters are set externally after
-        // construction.  They default to nil and zero values here.
-        RedisClient:      nil,
-        RateLimitMaxTokens: 0,
-        RateLimitRefillRate: 0,
-        RateLimitTTL:       0,
+		// RedisClient and rate limit parameters are set externally after
+		// construction.  They default to nil and zero values here.
+		RedisClient:         nil,
+		RateLimitMaxTokens:  0,
+		RateLimitRefillRate: 0,
+		RateLimitTTL:        0,
 	}
 }
 
@@ -90,12 +95,12 @@ func NewCustomerHandler(seatRepo *repository.SeatRepo, showRepo *repository.Show
 // implementation uses WATCH/MULTI to ensure atomic updates under
 // concurrent access.
 func (h *CustomerHandler) allowHold(ctx context.Context, userID uint64) (bool, error) {
-    _ = ctx
-    if h.RedisClient == nil || h.RateLimitMaxTokens <= 0 || h.RateLimitRefillRate <= 0 {
-        return true, nil
-    }
-    _ = userID
-    return true, nil
+	_ = ctx
+	if h.RedisClient == nil || h.RateLimitMaxTokens <= 0 || h.RateLimitRefillRate <= 0 {
+		return true, nil
+	}
+	_ = userID
+	return true, nil
 }
 
 func (h *CustomerHandler) HoldSeats(c echo.Context) error {
@@ -162,117 +167,117 @@ func (h *CustomerHandler) HoldSeats(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to cleanup expired holds"})
 		}
 	}
-    // ------------------------------------------------------------------
-    // Use row‑level locks to safely check and hold seats.  Without locking
-    // concurrent requests could both see a seat as FREE and then both
-    // update it to HELD, resulting in double booking.  SELECT … FOR UPDATE
-    // locks the show_seats row until the transaction commits.
-    // We'll build two lists: holdable (available seats) and unavailable.
-    unavailable := make([]uint64, 0)
-    holdable := make([]uint64, 0, len(unique))
-    for _, sid := range unique {
-        // Acquire lock on the show_seats row for this seat.  This lock
-        // prevents other transactions from reading or updating the row
-        // until we decide whether it's free.  If the row is missing this
-        // scan will return sql.ErrNoRows which we treat as unavailable.
-        var seatStatus string
-        err := tx.QueryRowContext(ctx,
-            `SELECT status FROM show_seats WHERE show_id = ? AND seat_id = ? FOR UPDATE`,
-            showID, sid,
-        ).Scan(&seatStatus)
-        if err != nil {
-            // If the seat does not exist, treat it as unavailable
-            if errors.Is(err, sql.ErrNoRows) {
-                unavailable = append(unavailable, sid)
-                continue
-            }
-            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to lock seat"})
-        }
-        // Only seats with status FREE can be held.  RESERVED or HELD
-        // seats are considered unavailable.  Using row‑level lock ensures
-        // the status cannot change between this check and the update.
-        if seatStatus != "FREE" {
-            unavailable = append(unavailable, sid)
-            continue
-        }
-        // Check if there is an active hold on this seat by any user.
-        // Even if the show_seats.status is FREE, there may be an
-        // unexpired seat_hold record.  We do not append FOR UPDATE
-        // here because we already hold a lock on show_seats; counting
-        // seat_holds does not require locking rows as we won't update
-        // seat_holds until later.
-        var holdCount int
-        if err := tx.QueryRowContext(ctx,
-            `SELECT COUNT(*) FROM seat_holds WHERE show_id = ? AND seat_id = ? AND expires_at > UTC_TIMESTAMP()`,
-            showID, sid,
-        ).Scan(&holdCount); err != nil {
-            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to check active holds"})
-        }
-        if holdCount > 0 {
-            unavailable = append(unavailable, sid)
-            continue
-        }
-        // Seat is free and not held; mark as holdable.  We keep the
-        // row lock until the transaction commits to prevent others from
-        // grabbing it concurrently.
-        holdable = append(holdable, sid)
-    }
-    // If any seats are unavailable, abort the operation and return
-    // them to the client.  The unavailable slice lists seats that are
-    // either already HELD/RESERVED or missing.  We do not commit the
-    // transaction in this case; the deferred rollback will release locks.
-    if len(unavailable) > 0 {
-        return c.JSON(http.StatusBadRequest, echo.Map{
-            "error":       "some seats are unavailable",
-            "unavailable": unavailable,
-        })
-    }
-    // At this point we have locked all requested seats and verified
-    // they are free.  Generate hold records with a 5 minute expiration.
-    expiresAt := time.Now().UTC().Add(5 * time.Minute)
-    holds, err := repository.GenerateHoldRecords(userID, showID, holdable, expiresAt)
-    if err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to generate hold tokens"})
-    }
-    // Insert seat_holds rows.  This does not conflict with the locked
-    // show_seats rows because we do not lock seat_holds when reading.
-    if err := h.SeatHoldRepo.CreateMultipleTx(ctx, tx, holds); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create holds"})
-    }
-    // Update show_seats.status to HELD for each seat.  Because we still
-    // hold the row locks from the earlier SELECT ... FOR UPDATE, this
-    // update cannot conflict with another transaction.  The status and
-    // version columns are updated atomically.
-    if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, holdable, "HELD"); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
-    }
-    // Commit the transaction.  This releases all row locks and makes
-    // the holds visible to other transactions.
-    if err := tx.Commit(); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
-    }
-    committed = true
-    // After the transaction commits, cache hold information in Redis so
-    // that seat status can be determined without querying the
-    // database.  Each seat receives a key with TTL equal to the hold
-    // duration.  If RedisClient is nil or an error occurs, we ignore
-    // the error and rely solely on the database status.  The
-    // information stored includes the user ID and expiration time.
-    if h.RedisClient != nil && len(holdable) > 0 {
-        ttl := time.Until(expiresAt)
-        for _, sid := range holdable {
-            key := fmt.Sprintf("hold:%d:%d", showID, sid)
-            val, _ := json.Marshal(struct {
-                UserID    uint64 `json:"user_id"`
-                ExpiresAt string `json:"expires_at"`
-            }{userID, expiresAt.Format(time.RFC3339)})
-            _ = h.RedisClient.Set(ctx, key, val, ttl).Err()
-        }
-    }
-    return c.JSON(http.StatusCreated, echo.Map{
-        "expires_at": expiresAt.Format(time.RFC3339),
-        "seat_ids":   holdable,
-    })
+	// ------------------------------------------------------------------
+	// Use row‑level locks to safely check and hold seats.  Without locking
+	// concurrent requests could both see a seat as FREE and then both
+	// update it to HELD, resulting in double booking.  SELECT … FOR UPDATE
+	// locks the show_seats row until the transaction commits.
+	// We'll build two lists: holdable (available seats) and unavailable.
+	unavailable := make([]uint64, 0)
+	holdable := make([]uint64, 0, len(unique))
+	for _, sid := range unique {
+		// Acquire lock on the show_seats row for this seat.  This lock
+		// prevents other transactions from reading or updating the row
+		// until we decide whether it's free.  If the row is missing this
+		// scan will return sql.ErrNoRows which we treat as unavailable.
+		var seatStatus string
+		err := tx.QueryRowContext(ctx,
+			`SELECT status FROM show_seats WHERE show_id = ? AND seat_id = ? FOR UPDATE`,
+			showID, sid,
+		).Scan(&seatStatus)
+		if err != nil {
+			// If the seat does not exist, treat it as unavailable
+			if errors.Is(err, sql.ErrNoRows) {
+				unavailable = append(unavailable, sid)
+				continue
+			}
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to lock seat"})
+		}
+		// Only seats with status FREE can be held.  RESERVED or HELD
+		// seats are considered unavailable.  Using row‑level lock ensures
+		// the status cannot change between this check and the update.
+		if seatStatus != "FREE" {
+			unavailable = append(unavailable, sid)
+			continue
+		}
+		// Check if there is an active hold on this seat by any user.
+		// Even if the show_seats.status is FREE, there may be an
+		// unexpired seat_hold record.  We do not append FOR UPDATE
+		// here because we already hold a lock on show_seats; counting
+		// seat_holds does not require locking rows as we won't update
+		// seat_holds until later.
+		var holdCount int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM seat_holds WHERE show_id = ? AND seat_id = ? AND expires_at > UTC_TIMESTAMP()`,
+			showID, sid,
+		).Scan(&holdCount); err != nil {
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to check active holds"})
+		}
+		if holdCount > 0 {
+			unavailable = append(unavailable, sid)
+			continue
+		}
+		// Seat is free and not held; mark as holdable.  We keep the
+		// row lock until the transaction commits to prevent others from
+		// grabbing it concurrently.
+		holdable = append(holdable, sid)
+	}
+	// If any seats are unavailable, abort the operation and return
+	// them to the client.  The unavailable slice lists seats that are
+	// either already HELD/RESERVED or missing.  We do not commit the
+	// transaction in this case; the deferred rollback will release locks.
+	if len(unavailable) > 0 {
+		return c.JSON(http.StatusBadRequest, echo.Map{
+			"error":       "some seats are unavailable",
+			"unavailable": unavailable,
+		})
+	}
+	// At this point we have locked all requested seats and verified
+	// they are free.  Generate hold records with a 5 minute expiration.
+	expiresAt := time.Now().UTC().Add(5 * time.Minute)
+	holds, err := repository.GenerateHoldRecords(userID, showID, holdable, expiresAt)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to generate hold tokens"})
+	}
+	// Insert seat_holds rows.  This does not conflict with the locked
+	// show_seats rows because we do not lock seat_holds when reading.
+	if err := h.SeatHoldRepo.CreateMultipleTx(ctx, tx, holds); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create holds"})
+	}
+	// Update show_seats.status to HELD for each seat.  Because we still
+	// hold the row locks from the earlier SELECT ... FOR UPDATE, this
+	// update cannot conflict with another transaction.  The status and
+	// version columns are updated atomically.
+	if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, holdable, "HELD"); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
+	}
+	// Commit the transaction.  This releases all row locks and makes
+	// the holds visible to other transactions.
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
+	}
+	committed = true
+	// After the transaction commits, cache hold information in Redis so
+	// that seat status can be determined without querying the
+	// database.  Each seat receives a key with TTL equal to the hold
+	// duration.  If RedisClient is nil or an error occurs, we ignore
+	// the error and rely solely on the database status.  The
+	// information stored includes the user ID and expiration time.
+	if h.RedisClient != nil && len(holdable) > 0 {
+		ttl := time.Until(expiresAt)
+		for _, sid := range holdable {
+			key := fmt.Sprintf("hold:%d:%d", showID, sid)
+			val, _ := json.Marshal(struct {
+				UserID    uint64 `json:"user_id"`
+				ExpiresAt string `json:"expires_at"`
+			}{userID, expiresAt.Format(time.RFC3339)})
+			_ = h.RedisClient.Set(ctx, key, val, ttl).Err()
+		}
+	}
+	return c.JSON(http.StatusCreated, echo.Map{
+		"expires_at": expiresAt.Format(time.RFC3339),
+		"seat_ids":   holdable,
+	})
 }
 
 // ReleaseHolds handles DELETE /v1/shows/:id/hold.  It releases all holds for
@@ -309,20 +314,20 @@ func (h *CustomerHandler) ReleaseHolds(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
 		}
 	}
-    if err := tx.Commit(); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
-    }
-    committed = true
-    // Remove cached hold keys from Redis now that the holds are released.
-    if h.RedisClient != nil && len(seatIDs) > 0 {
-        for _, sid := range seatIDs {
-            key := fmt.Sprintf("hold:%d:%d", showID, sid)
-            _ = h.RedisClient.Del(ctx, key).Err()
-        }
-    }
-    return c.JSON(http.StatusOK, echo.Map{
-        "released": len(seatIDs),
-    })
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
+	}
+	committed = true
+	// Remove cached hold keys from Redis now that the holds are released.
+	if h.RedisClient != nil && len(seatIDs) > 0 {
+		for _, sid := range seatIDs {
+			key := fmt.Sprintf("hold:%d:%d", showID, sid)
+			_ = h.RedisClient.Del(ctx, key).Err()
+		}
+	}
+	return c.JSON(http.StatusOK, echo.Map{
+		"released": len(seatIDs),
+	})
 }
 
 // ConfirmSeats (also mapped to POST /v1/shows/:id/reserve) finalises
@@ -374,146 +379,188 @@ func (h *CustomerHandler) ConfirmSeats(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to cleanup expired holds"})
 		}
 	}
-    // load active holds for user + show.  This fetches all seat_holds
-    // belonging to the current user that have not expired.  We will
-    // validate each hold individually under row‑level locks below.
-    holds, err := h.SeatHoldRepo.ActiveHoldsByUserAndShowTx(ctx, tx, userID, showID)
-    if err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to load holds"})
-    }
-    if len(holds) == 0 {
-        return c.JSON(http.StatusBadRequest, echo.Map{"error": "no active holds for this show"})
-    }
-    // Build a set of held seat IDs for quick lookup and preserve order.
-    seatIDs := make([]uint64, 0, len(holds))
-    heldByUser := make(map[uint64]struct{})
-    for _, hld := range holds {
-        seatIDs = append(seatIDs, hld.SeatID)
-        heldByUser[hld.SeatID] = struct{}{}
-    }
-    // Use row‑level locks to ensure that each seat is still HELD by this
-    // user and has not been reserved or held by someone else in the
-    // meantime.  Without locking, concurrent confirmations could both
-    // see the seat as HELD and reserve it twice.  We track any seats
-    // failing validation in unavailable.
-    unavailable := make([]uint64, 0)
-    for _, sid := range seatIDs {
-        // Lock the show_seats row for this seat.  This prevents status
-        // changes until we commit.  If the row is missing, treat as
-        // unavailable.
-        var seatStatus string
-        if err := tx.QueryRowContext(ctx,
-            `SELECT status FROM show_seats WHERE show_id = ? AND seat_id = ? FOR UPDATE`,
-            showID, sid,
-        ).Scan(&seatStatus); err != nil {
-            if errors.Is(err, sql.ErrNoRows) {
-                unavailable = append(unavailable, sid)
-                continue
-            }
-            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to lock seat"})
-        }
-        // Seat must currently be HELD.  If it is FREE or RESERVED, the
-        // hold is invalid or has been overtaken by another transaction.
-        if seatStatus != "HELD" {
-            unavailable = append(unavailable, sid)
-            continue
-        }
-        // Verify the seat hold record still belongs to the user.  We
-        // query seat_holds to ensure there is exactly one active hold by
-        // this user for this seat.  Without this check, a seat could be
-        // held by another user but still have status HELD.
-        var cnt int
-        if err := tx.QueryRowContext(ctx,
-            `SELECT COUNT(*) FROM seat_holds WHERE show_id = ? AND seat_id = ? AND user_id = ? AND expires_at > UTC_TIMESTAMP()`,
-            showID, sid, userID,
-        ).Scan(&cnt); err != nil {
-            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to verify seat hold"})
-        }
-        if cnt == 0 {
-            unavailable = append(unavailable, sid)
-            continue
-        }
-    }
-    if len(unavailable) > 0 {
-        // One or more seats cannot be confirmed.  Abort without
-        // committing; rollback will release locks.  Return a 400 so
-        // the client knows which seats failed.  Removing holds or
-        // cleaning up is not performed here; clients may retry.
-        return c.JSON(http.StatusBadRequest, echo.Map{
-            "error":       "some seats cannot be confirmed",
-            "unavailable": unavailable,
-        })
-    }
-    // Compute total price from show_seats for the held seats.  We do
-    // this after locking to ensure consistent pricing.  If any seat is
-    // missing a price, return an error.  priceMap maps seat_id to price.
-    priceMap, err := h.ShowSeatRepo.GetPricesBySeatIDsTx(ctx, tx, showID, seatIDs)
-    if err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to fetch seat prices"})
-    }
-    total := uint32(0)
-    for _, sid := range seatIDs {
-        if p, ok := priceMap[sid]; ok {
-            total += p
-        } else {
-            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "price not found for seat"})
-        }
-    }
-    // Insert the reservation record.  We set status to CONFIRMED as
-    // holds are turned into a final reservation.  The ID is
-    // auto‑generated by the database.
-    resRec := &repository.ReservationRecord{
-        UserID:           userID,
-        ShowID:           showID,
-        Status:           "CONFIRMED",
-        TotalAmountCents: total,
-    }
-    if err := h.ReservationRepo.CreateTx(ctx, tx, resRec); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create reservation"})
-    }
-    // Prepare reservation_seats entries for each seat.  These map the
-    // reservation to individual seats and their prices.
-    seats := make([]repository.ReservationSeatRecord, 0, len(seatIDs))
-    for _, sid := range seatIDs {
-        seats = append(seats, repository.ReservationSeatRecord{
-            ReservationID: resRec.ID,
-            ShowID:        showID,
-            SeatID:        sid,
-            PriceCents:    priceMap[sid],
-        })
-    }
-    if err := h.ReservationRepo.CreateSeatsBulkTx(ctx, tx, seats); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create reservation seats"})
-    }
-    // Update show_seats.status to RESERVED for all seats.  Because we
-    // still hold row‑level locks, no other transaction can change the
-    // status concurrently.  BulkUpdateStatusTx increments the version
-    // and updates updated_at.
-    if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, seatIDs, "RESERVED"); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
-    }
-    // Remove seat_holds for this user and show.  This frees the
-    // seat_holds rows and prevents duplicate confirmations.  We ignore
-    // the returned list of seat IDs here since we already know them.
-    if _, err := h.SeatHoldRepo.DeleteByUserAndShowTx(ctx, tx, userID, showID); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to delete holds"})
-    }
-    // Commit the transaction to persist all changes and release locks.
-    if err := tx.Commit(); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
-    }
-    committed = true
-    // Delete cached hold keys in Redis now that the seats are confirmed.
-    if h.RedisClient != nil {
-        for _, sid := range seatIDs {
-            key := fmt.Sprintf("hold:%d:%d", showID, sid)
-            _ = h.RedisClient.Del(ctx, key).Err()
-        }
-    }
-    return c.JSON(http.StatusCreated, echo.Map{
-        "reservation_id":     resRec.ID,
-        "total_amount_cents": total,
-    })
+	// load active holds for user + show.  This fetches all seat_holds
+	// belonging to the current user that have not expired.  We will
+	// validate each hold individually under row‑level locks below.
+	holds, err := h.SeatHoldRepo.ActiveHoldsByUserAndShowTx(ctx, tx, userID, showID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to load holds"})
+	}
+	if len(holds) == 0 {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "no active holds for this show"})
+	}
+	// Build a set of held seat IDs for quick lookup and preserve order.
+	seatIDs := make([]uint64, 0, len(holds))
+	heldByUser := make(map[uint64]struct{})
+	for _, hld := range holds {
+		seatIDs = append(seatIDs, hld.SeatID)
+		heldByUser[hld.SeatID] = struct{}{}
+	}
+	// Use row‑level locks to ensure that each seat is still HELD by this
+	// user and has not been reserved or held by someone else in the
+	// meantime.  Without locking, concurrent confirmations could both
+	// see the seat as HELD and reserve it twice.  We track any seats
+	// failing validation in unavailable.
+	unavailable := make([]uint64, 0)
+	for _, sid := range seatIDs {
+		// Lock the show_seats row for this seat.  This prevents status
+		// changes until we commit.  If the row is missing, treat as
+		// unavailable.
+		var seatStatus string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT status FROM show_seats WHERE show_id = ? AND seat_id = ? FOR UPDATE`,
+			showID, sid,
+		).Scan(&seatStatus); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				unavailable = append(unavailable, sid)
+				continue
+			}
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to lock seat"})
+		}
+		// Seat must currently be HELD.  If it is FREE or RESERVED, the
+		// hold is invalid or has been overtaken by another transaction.
+		if seatStatus != "HELD" {
+			unavailable = append(unavailable, sid)
+			continue
+		}
+		// Verify the seat hold record still belongs to the user.  We
+		// query seat_holds to ensure there is exactly one active hold by
+		// this user for this seat.  Without this check, a seat could be
+		// held by another user but still have status HELD.
+		var cnt int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM seat_holds WHERE show_id = ? AND seat_id = ? AND user_id = ? AND expires_at > UTC_TIMESTAMP()`,
+			showID, sid, userID,
+		).Scan(&cnt); err != nil {
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to verify seat hold"})
+		}
+		if cnt == 0 {
+			unavailable = append(unavailable, sid)
+			continue
+		}
+	}
+	if len(unavailable) > 0 {
+		// One or more seats cannot be confirmed.  Abort without
+		// committing; rollback will release locks.  Return a 400 so
+		// the client knows which seats failed.  Removing holds or
+		// cleaning up is not performed here; clients may retry.
+		return c.JSON(http.StatusBadRequest, echo.Map{
+			"error":       "some seats cannot be confirmed",
+			"unavailable": unavailable,
+		})
+	}
+	// Compute total price from show_seats for the held seats.  We do
+	// this after locking to ensure consistent pricing.  If any seat is
+	// missing a price, return an error.  priceMap maps seat_id to price.
+	priceMap, err := h.ShowSeatRepo.GetPricesBySeatIDsTx(ctx, tx, showID, seatIDs)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to fetch seat prices"})
+	}
+	total := uint32(0)
+	for _, sid := range seatIDs {
+		if p, ok := priceMap[sid]; ok {
+			total += p
+		} else {
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "price not found for seat"})
+		}
+	}
+	// Insert the reservation record.  We set status to CONFIRMED as
+	// holds are turned into a final reservation.  The ID is
+	// auto‑generated by the database.
+	resRec := &repository.ReservationRecord{
+		UserID:           userID,
+		ShowID:           showID,
+		Status:           "CONFIRMED",
+		TotalAmountCents: total,
+	}
+	if err := h.ReservationRepo.CreateTx(ctx, tx, resRec); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create reservation"})
+	}
+	// Prepare reservation_seats entries for each seat.  These map the
+	// reservation to individual seats and their prices.
+	seats := make([]repository.ReservationSeatRecord, 0, len(seatIDs))
+	for _, sid := range seatIDs {
+		seats = append(seats, repository.ReservationSeatRecord{
+			ReservationID: resRec.ID,
+			ShowID:        showID,
+			SeatID:        sid,
+			PriceCents:    priceMap[sid],
+		})
+	}
+	if err := h.ReservationRepo.CreateSeatsBulkTx(ctx, tx, seats); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create reservation seats"})
+	}
+	// Update show_seats.status to RESERVED for all seats.  Because we
+	// still hold row‑level locks, no other transaction can change the
+	// status concurrently.  BulkUpdateStatusTx increments the version
+	// and updates updated_at.
+	if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, seatIDs, "RESERVED"); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
+	}
+	// Remove seat_holds for this user and show.  This frees the
+	// seat_holds rows and prevents duplicate confirmations.  We ignore
+	// the returned list of seat IDs here since we already know them.
+	if _, err := h.SeatHoldRepo.DeleteByUserAndShowTx(ctx, tx, userID, showID); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to delete holds"})
+	}
+	// Commit the transaction to persist all changes and release locks.
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
+	}
+	committed = true
+	// Delete cached hold keys in Redis now that the seats are confirmed.
+	if h.RedisClient != nil {
+		for _, sid := range seatIDs {
+			key := fmt.Sprintf("hold:%d:%d", showID, sid)
+			_ = h.RedisClient.Del(ctx, key).Err()
+		}
+	}
+	// Build and publish booking confirmed event asynchronously. Errors are logged inside publisher.
+	if det, err := h.ReservationRepo.GetByIDForUser(ctx, resRec.ID, userID); err == nil && det != nil {
+		seatLabels := make([]string, 0, len(det.Seats))
+		for _, s := range det.Seats {
+			seatLabels = append(seatLabels, fmt.Sprintf("%s%d", s.RowLabel, s.SeatNumber))
+		}
+		var cinemaID uint64
+		var cinemaName string
+		if det.CinemaID != nil {
+			cinemaID = *det.CinemaID
+		}
+		if det.CinemaName != nil {
+			cinemaName = *det.CinemaName
+		}
+		startsAt := ""
+		endsAt := ""
+		if det.StartTime != nil {
+			startsAt = *det.StartTime
+		}
+		if det.EndTime != nil {
+			endsAt = *det.EndTime
+		}
+		event := qevt.BookingConfirmedEvent{
+			ReservationID:    resRec.ID,
+			UserID:           userID,
+			ShowID:           det.ShowID,
+			CinemaID:         cinemaID,
+			CinemaName:       cinemaName,
+			HallID:           det.HallID,
+			HallName:         det.HallName,
+			MovieTitle:       det.ShowTitle,
+			StartsAt:         startsAt,
+			EndsAt:           endsAt,
+			SeatLabels:       seatLabels,
+			TotalAmountCents: total,
+			ConfirmedAt:      time.Now().UTC().Format(time.RFC3339),
+		}
+		_ = queue_publisher.PublishBookingConfirmed(ctx, event)
+	} else if err != nil {
+		// Do not fail the request if building the event fails.
+		log.Printf("failed to build booking event: %v", err)
+	}
+	return c.JSON(http.StatusCreated, echo.Map{
+		"reservation_id":     resRec.ID,
+		"total_amount_cents": total,
+	})
 }
 
 // ListReservations handles GET /v1/my-reservations.  It returns all
@@ -542,36 +589,36 @@ func (h *CustomerHandler) ListReservations(c echo.Context) error {
 // reservation belongs to a different user, it responds with 403.  Any
 // unexpected error results in a 500 response.
 func (h *CustomerHandler) GetReservation(c echo.Context) error {
-    userID, err := getUserID(c)
-    if err != nil {
-        return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
-    }
-    resID, err := strconv.ParseUint(c.Param("id"), 10, 64)
-    if err != nil || resID == 0 {
-        return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid reservation id"})
-    }
-    ctx := c.Request().Context()
+	userID, err := getUserID(c)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
+	}
+	resID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || resID == 0 {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid reservation id"})
+	}
+	ctx := c.Request().Context()
 
-    // Apply rate limiting before starting a DB transaction.  This uses a
-    // token bucket implemented in Redis to prevent abuse of the hold
-    // endpoint.  If the user has exhausted their quota, respond with
-    // HTTP 429.  Any error from allowHold is ignored and we proceed.
-    if ok, errRate := h.allowHold(ctx, userID); errRate == nil {
-        if !ok {
-            return c.JSON(http.StatusTooManyRequests, echo.Map{"error": "too many requests"})
-        }
-    }
-    detail, err := h.ReservationRepo.GetByIDForUser(ctx, resID, userID)
-    if err != nil {
-        if errors.Is(err, sql.ErrNoRows) {
-            // reservation not found or not owned by user (ownership enforced in repo)
-            return c.JSON(http.StatusNotFound, echo.Map{"error": "reservation not found"})
-        }
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to fetch reservation"})
-    }
-    return c.JSON(http.StatusOK, echo.Map{
-        "item": detail,
-    })
+	// Apply rate limiting before starting a DB transaction.  This uses a
+	// token bucket implemented in Redis to prevent abuse of the hold
+	// endpoint.  If the user has exhausted their quota, respond with
+	// HTTP 429.  Any error from allowHold is ignored and we proceed.
+	if ok, errRate := h.allowHold(ctx, userID); errRate == nil {
+		if !ok {
+			return c.JSON(http.StatusTooManyRequests, echo.Map{"error": "too many requests"})
+		}
+	}
+	detail, err := h.ReservationRepo.GetByIDForUser(ctx, resID, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// reservation not found or not owned by user (ownership enforced in repo)
+			return c.JSON(http.StatusNotFound, echo.Map{"error": "reservation not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to fetch reservation"})
+	}
+	return c.JSON(http.StatusOK, echo.Map{
+		"item": detail,
+	})
 }
 
 // DeleteReservation handles DELETE /v1/reservations/:id.  It cancels a
@@ -581,53 +628,53 @@ func (h *CustomerHandler) GetReservation(c echo.Context) error {
 // another user, and 409 when the show has already started.  All
 // operations are executed within a transaction.
 func (h *CustomerHandler) DeleteReservation(c echo.Context) error {
-    userID, err := getUserID(c)
-    if err != nil {
-        return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
-    }
-    resID, err := strconv.ParseUint(c.Param("id"), 10, 64)
-    if err != nil || resID == 0 {
-        return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid reservation id"})
-    }
-    ctx := c.Request().Context()
-    tx, err := h.ShowRepo.DB().BeginTx(ctx, nil)
-    if err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to start transaction"})
-    }
-    committed := false
-    defer func() {
-        if !committed {
-            _ = tx.Rollback()
-        }
-    }()
-    showID, startTime, seatIDs, err := h.ReservationRepo.GetInfoForUserTx(ctx, tx, resID, userID)
-    if err != nil {
-        if errors.Is(err, sql.ErrNoRows) {
-            return c.JSON(http.StatusNotFound, echo.Map{"error": "reservation not found"})
-        }
-        if errors.Is(err, repository.ErrForbidden) {
-            return c.JSON(http.StatusForbidden, echo.Map{"error": "forbidden"})
-        }
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to load reservation info"})
-    }
-    // Check if the show has already started; if so, return conflict
-    if !startTime.After(time.Now().UTC()) {
-        return c.JSON(http.StatusConflict, echo.Map{"error": "show already started"})
-    }
-    // Delete the reservation; cascade deletes reservation_seats due to FK
-    const del = `DELETE FROM reservations WHERE id = ?`
-    if _, err := tx.ExecContext(ctx, del, resID); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to delete reservation"})
-    }
-    // Return seats to FREE status
-    if len(seatIDs) > 0 {
-        if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, seatIDs, "FREE"); err != nil {
-            return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
-        }
-    }
-    if err := tx.Commit(); err != nil {
-        return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
-    }
-    committed = true
-    return c.NoContent(http.StatusNoContent)
+	userID, err := getUserID(c)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
+	}
+	resID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || resID == 0 {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid reservation id"})
+	}
+	ctx := c.Request().Context()
+	tx, err := h.ShowRepo.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to start transaction"})
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	showID, startTime, seatIDs, err := h.ReservationRepo.GetInfoForUserTx(ctx, tx, resID, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.JSON(http.StatusNotFound, echo.Map{"error": "reservation not found"})
+		}
+		if errors.Is(err, repository.ErrForbidden) {
+			return c.JSON(http.StatusForbidden, echo.Map{"error": "forbidden"})
+		}
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to load reservation info"})
+	}
+	// Check if the show has already started; if so, return conflict
+	if !startTime.After(time.Now().UTC()) {
+		return c.JSON(http.StatusConflict, echo.Map{"error": "show already started"})
+	}
+	// Delete the reservation; cascade deletes reservation_seats due to FK
+	const del = `DELETE FROM reservations WHERE id = ?`
+	if _, err := tx.ExecContext(ctx, del, resID); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to delete reservation"})
+	}
+	// Return seats to FREE status
+	if len(seatIDs) > 0 {
+		if err := h.ShowSeatRepo.BulkUpdateStatusTx(ctx, tx, showID, seatIDs, "FREE"); err != nil {
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to update seat status"})
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to commit transaction"})
+	}
+	committed = true
+	return c.NoContent(http.StatusNoContent)
 }

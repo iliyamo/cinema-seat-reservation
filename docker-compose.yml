@@ -1,17 +1,109 @@
-version: '3.8'
-
-# This compose file defines a Redis service for local development and testing.
-# To run the API containerised, you can add a service for the Go application.
+version: "3.9"
 
 services:
-  # Redis service used for rate limiting and HTTP response caching
+  mysql:
+    image: mysql:8.0
+    container_name: cinema_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: secret
+      MYSQL_DATABASE: cinema
+      MYSQL_USER: cinema_user
+      MYSQL_PASSWORD: cinema_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./internal/Docs/cinema.sql:/docker-entrypoint-initdb.d/1_cinema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -psecret --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
   redis:
     image: redis:7-alpine
+    container_name: cinema_redis
     restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: cinema_rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cinema_api
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./logs:/home/app/logs
+    # مهم: اینجا فقط برای کانتینر API آدرس‌ها رو به سرویس‌های داکر override می‌کنیم
+    environment:
+      # App
+      APP_ENV: ${APP_ENV:-dev}
+      APP_PORT: ${APP_PORT:-8080}
+
+      # DB → connect to the mysql service.  Use the same credentials defined on
+      # the mysql service (MYSQL_USER/MYSQL_PASSWORD) if available.  Fall
+      # back to the sensible defaults used in this compose file.
+      DB_USER: ${MYSQL_USER:-cinema_user}
+      DB_PASS: ${MYSQL_PASSWORD:-cinema_pass}
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${MYSQL_DATABASE:-cinema}
+
+      # Redis → به سرویس redis وصل شو
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_TLS: ${REDIS_TLS:-false}
+
+      # RabbitMQ → به سرویس rabbitmq وصل شو
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+
+      # Security / cache / rate-limit (از .envت اگر هست، ورنه پیش‌فرض)
+      JWT_SECRET: ${JWT_SECRET:-super-secret-use-a-long-random-value}
+      ACCESS_TOKEN_TTL_MIN: ${ACCESS_TOKEN_TTL_MIN:-15}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-7}
+      BCRYPT_COST: ${BCRYPT_COST:-12}
+
+      CACHE_ENABLED: ${CACHE_ENABLED:-true}
+      CACHE_METHODS: ${CACHE_METHODS:-GET}
+      CACHE_TTL: ${CACHE_TTL:-30s}
+      CACHE_KEY_STRATEGY: ${CACHE_KEY_STRATEGY:-route_query}
+      CACHE_PREFIX: ${CACHE_PREFIX:-cache}
+      CACHE_MAX_BODY_BYTES: ${CACHE_MAX_BODY_BYTES:-1048576}
 
 volumes:
+  mysql_data:
   redis_data:

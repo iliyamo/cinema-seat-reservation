@@ -23,8 +23,9 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash VARCHAR(255) NOT NULL,
   role_id INT UNSIGNED NULL,
   display_name VARCHAR(128) NULL,
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uk_users_email (email),
   KEY idx_users_role_id (role_id),
@@ -49,18 +50,20 @@ CREATE TABLE IF NOT EXISTS cinemas (
 -- HALLS
 CREATE TABLE IF NOT EXISTS halls (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  owner_id BIGINT UNSIGNED NULL, -- legacy (kept for compatibility; not FK-enforced)
+  owner_id BIGINT UNSIGNED NOT NULL,
   cinema_id BIGINT UNSIGNED NULL,
   name VARCHAR(128) NOT NULL,
   description TEXT NULL,
   seat_rows INT UNSIGNED NULL,
   seat_cols INT UNSIGNED NULL,
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
-  -- legacy unique on (owner_id, name) removed in migrations; keep a non-unique composite if present
+  -- index the owner + cinema + name to allow duplicate hall names across cinemas
   KEY idx_owner_cinema_name (owner_id, cinema_id, name),
   KEY idx_halls_cinema_id (cinema_id, id),
+  CONSTRAINT fk_halls_owner FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE RESTRICT,
   CONSTRAINT fk_halls_cinema FOREIGN KEY (cinema_id) REFERENCES cinemas(id)
     ON UPDATE CASCADE ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -69,12 +72,14 @@ CREATE TABLE IF NOT EXISTS halls (
 CREATE TABLE IF NOT EXISTS seats (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   hall_id BIGINT UNSIGNED NOT NULL,
-  row_label VARCHAR(16) NOT NULL,
-  seat_number INT UNSIGNED NOT NULL,
+  row_label VARCHAR(8) NOT NULL,                  -- e.g. A, B, C or 1,2,3
+  seat_number INT UNSIGNED NOT NULL,             -- e.g. 1..30
+  seat_type ENUM('STANDARD','VIP','ACCESSIBLE') NOT NULL DEFAULT 'STANDARD',
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
-  UNIQUE KEY uk_seats_hall_row_no (hall_id, row_label, seat_number),
+  UNIQUE KEY uk_hall_row_no (hall_id, row_label, seat_number),
   KEY idx_seats_hall (hall_id),
   CONSTRAINT fk_seats_hall FOREIGN KEY (hall_id) REFERENCES halls(id)
     ON UPDATE CASCADE ON DELETE RESTRICT
@@ -180,6 +185,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   user_id BIGINT UNSIGNED NOT NULL,
   token_hash CHAR(64) NOT NULL,
   expires_at DATETIME NOT NULL,
+  revoked_at DATETIME NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uk_token_hash (token_hash),

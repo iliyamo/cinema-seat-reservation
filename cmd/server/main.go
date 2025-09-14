@@ -14,6 +14,8 @@ import (
     "github.com/iliyamo/cinema-seat-reservation/internal/middleware" // import middleware for caching and rate limiting
     "github.com/iliyamo/cinema-seat-reservation/internal/repository" // import repositories for persistence
     "github.com/iliyamo/cinema-seat-reservation/internal/router"     // import router to register routes
+
+    q "github.com/iliyamo/cinema-seat-reservation/internal/queue" // queue consumer for async logging
 )
 
 // loadDotEnv attempts to load environment variables from a list of potential
@@ -112,6 +114,14 @@ func main() {
         customerH.RedisClient = redisClient
         // register customer routes requiring JWT auth and CUSTOMER role
         router.RegisterCustomer(e, customerH, cfg.JWTSecret)
+
+    // Start the booking event consumer in a separate goroutine.  Any failure
+    // will terminate the application.  This runs concurrently with the HTTP server.
+    go func() {
+        if err := q.StartBookingConsumer(); err != nil {
+            log.Fatalf("booking consumer failed: %v", err)
+        }
+    }()
 
     addr := ":" + cfg.Port                    // build the address string using the configured port
     log.Printf("listening on %s (env=%s)", addr, cfg.Env) // log where the server is about to start
