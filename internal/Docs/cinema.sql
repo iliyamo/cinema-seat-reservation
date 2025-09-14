@@ -1,197 +1,450 @@
--- cinema_updated.sql
--- Clean bootstrap schema aligned with /Docs migrations (through 0010 + 0011 indexes)
--- Compatible with MySQL 5.7+/8.0+ and MariaDB 10.4+
--- Engine: InnoDB, Charset: utf8mb4, Collation: utf8mb4_unicode_ci
+-- phpMyAdmin SQL Dump
+-- version 5.2.1
+-- https://www.phpmyadmin.net/
+--
+-- Host: 127.0.0.1
+-- Generation Time: Sep 14, 2025 at 03:17 PM
+-- Server version: 10.4.32-MariaDB
+-- PHP Version: 8.2.12
 
-SET NAMES utf8mb4;
-SET FOREIGN_KEY_CHECKS = 0;
+SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
+START TRANSACTION;
+SET time_zone = "+00:00";
 
--- ROLES
-CREATE TABLE IF NOT EXISTS roles (
-  id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-  name VARCHAR(64) NOT NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  UNIQUE KEY uk_roles_name (name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- USERS
-CREATE TABLE IF NOT EXISTS users (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  email VARCHAR(320) NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  role_id INT UNSIGNED NULL,
-  display_name VARCHAR(128) NULL,
-  is_active TINYINT(1) NOT NULL DEFAULT 1,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  UNIQUE KEY uk_users_email (email),
-  KEY idx_users_role_id (role_id),
-  CONSTRAINT fk_users_role FOREIGN KEY (role_id) REFERENCES roles(id)
-    ON UPDATE CASCADE ON DELETE SET NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;
+/*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;
+/*!40101 SET NAMES utf8mb4 */;
 
--- CINEMAS
-CREATE TABLE IF NOT EXISTS cinemas (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  owner_id BIGINT UNSIGNED NOT NULL,
-  name VARCHAR(100) NOT NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  UNIQUE KEY uk_cinemas_owner_name (owner_id, name),
-  KEY idx_cinemas_owner_id (owner_id),
-  CONSTRAINT fk_cinemas_owner FOREIGN KEY (owner_id) REFERENCES users(id)
-    ON UPDATE CASCADE ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+--
+-- Database: `cinema`
+--
 
--- HALLS
-CREATE TABLE IF NOT EXISTS halls (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  owner_id BIGINT UNSIGNED NOT NULL,
-  cinema_id BIGINT UNSIGNED NULL,
-  name VARCHAR(128) NOT NULL,
-  description TEXT NULL,
-  seat_rows INT UNSIGNED NULL,
-  seat_cols INT UNSIGNED NULL,
-  is_active TINYINT(1) NOT NULL DEFAULT 1,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  -- index the owner + cinema + name to allow duplicate hall names across cinemas
-  KEY idx_owner_cinema_name (owner_id, cinema_id, name),
-  KEY idx_halls_cinema_id (cinema_id, id),
-  CONSTRAINT fk_halls_owner FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE RESTRICT,
-  CONSTRAINT fk_halls_cinema FOREIGN KEY (cinema_id) REFERENCES cinemas(id)
-    ON UPDATE CASCADE ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- --------------------------------------------------------
 
--- SEATS
-CREATE TABLE IF NOT EXISTS seats (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  hall_id BIGINT UNSIGNED NOT NULL,
-  row_label VARCHAR(8) NOT NULL,                  -- e.g. A, B, C or 1,2,3
-  seat_number INT UNSIGNED NOT NULL,             -- e.g. 1..30
-  seat_type ENUM('STANDARD','VIP','ACCESSIBLE') NOT NULL DEFAULT 'STANDARD',
-  is_active TINYINT(1) NOT NULL DEFAULT 1,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  UNIQUE KEY uk_hall_row_no (hall_id, row_label, seat_number),
-  KEY idx_seats_hall (hall_id),
-  CONSTRAINT fk_seats_hall FOREIGN KEY (hall_id) REFERENCES halls(id)
-    ON UPDATE CASCADE ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+--
+-- Table structure for table `cinemas`
+--
 
--- SHOWS
-CREATE TABLE IF NOT EXISTS shows (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  hall_id BIGINT UNSIGNED NOT NULL,
-  movie_title VARCHAR(255) NOT NULL,
-  starts_at DATETIME NOT NULL,
-  ends_at DATETIME NOT NULL,
-  price_cents INT UNSIGNED NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  KEY idx_shows_hall_starts (hall_id, starts_at),
-  KEY idx_shows_hall_ends (hall_id, ends_at),
-  CONSTRAINT fk_shows_hall FOREIGN KEY (hall_id) REFERENCES halls(id)
-    ON UPDATE CASCADE ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE `cinemas` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `owner_id` bigint(20) UNSIGNED NOT NULL,
+  `name` varchar(100) NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
--- SHOW_SEATS
-CREATE TABLE IF NOT EXISTS show_seats (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  show_id BIGINT UNSIGNED NOT NULL,
-  seat_id BIGINT UNSIGNED NOT NULL,
-  status ENUM('FREE','HELD','RESERVED') NOT NULL DEFAULT 'FREE',
-  updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  UNIQUE KEY uk_showseats_show_seat (show_id, seat_id),
-  KEY idx_showseats_show (show_id),
-  KEY idx_showseats_seat (seat_id),
-  CONSTRAINT fk_showseats_show FOREIGN KEY (show_id) REFERENCES shows(id)
-    ON UPDATE CASCADE ON DELETE CASCADE,
-  CONSTRAINT fk_showseats_seat FOREIGN KEY (seat_id) REFERENCES seats(id)
-    ON UPDATE CASCADE ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- --------------------------------------------------------
 
--- SEAT_HOLDS
-CREATE TABLE IF NOT EXISTS seat_holds (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  user_id BIGINT UNSIGNED NULL,
-  show_id BIGINT UNSIGNED NOT NULL,
-  seat_id BIGINT UNSIGNED NOT NULL,
-  hold_token CHAR(64) NOT NULL,
-  expires_at DATETIME NOT NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  UNIQUE KEY uk_seat_holds_token (hold_token),
-  UNIQUE KEY uk_seat_holds_active (show_id, seat_id),
-  KEY idx_hold_show (show_id),
-  KEY idx_hold_expires (expires_at),
-  KEY idx_hold_show_expires (show_id, expires_at),
-  CONSTRAINT fk_hold_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
-  CONSTRAINT fk_hold_show FOREIGN KEY (show_id) REFERENCES shows(id) ON DELETE RESTRICT,
-  CONSTRAINT fk_hold_seat FOREIGN KEY (seat_id) REFERENCES seats(id) ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+--
+-- Table structure for table `halls`
+--
 
--- RESERVATIONS
-CREATE TABLE IF NOT EXISTS reservations (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  user_id BIGINT UNSIGNED NOT NULL,
-  show_id BIGINT UNSIGNED NOT NULL,
-  status ENUM('PENDING','CONFIRMED','CANCELLED') NOT NULL DEFAULT 'PENDING',
-  total_cents INT UNSIGNED NULL,
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  KEY idx_res_user (user_id),
-  KEY idx_res_show (show_id),
-  KEY idx_res_user_created (user_id, created_at),
-  KEY idx_res_show_created (show_id, created_at),
-  CONSTRAINT fk_res_user FOREIGN KEY (user_id) REFERENCES users(id)
-    ON UPDATE CASCADE ON DELETE RESTRICT,
-  CONSTRAINT fk_res_show FOREIGN KEY (show_id) REFERENCES shows(id)
-    ON UPDATE CASCADE ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE `halls` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `owner_id` bigint(20) UNSIGNED NOT NULL,
+  `cinema_id` bigint(20) UNSIGNED DEFAULT NULL,
+  `name` varchar(100) NOT NULL,
+  `description` text DEFAULT NULL,
+  `seat_rows` int(10) UNSIGNED DEFAULT NULL,
+  `seat_cols` int(10) UNSIGNED DEFAULT NULL,
+  `is_active` tinyint(1) NOT NULL DEFAULT 1,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
--- RESERVATION_SEATS
-CREATE TABLE IF NOT EXISTS reservation_seats (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  reservation_id BIGINT UNSIGNED NOT NULL,
-  show_id BIGINT UNSIGNED NOT NULL,
-  seat_id BIGINT UNSIGNED NOT NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  UNIQUE KEY uk_res_seat_unique (show_id, seat_id),
-  KEY idx_resseat_reservation (reservation_id),
-  KEY idx_resseat_show (show_id),
-  KEY idx_resseat_seat (seat_id),
-  CONSTRAINT fk_resseat_reservation FOREIGN KEY (reservation_id) REFERENCES reservations(id)
-    ON UPDATE CASCADE ON DELETE CASCADE,
-  CONSTRAINT fk_resseat_show FOREIGN KEY (show_id) REFERENCES shows(id)
-    ON UPDATE CASCADE ON DELETE RESTRICT,
-  CONSTRAINT fk_resseat_seat FOREIGN KEY (seat_id) REFERENCES seats(id)
-    ON UPDATE CASCADE ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- --------------------------------------------------------
 
--- REFRESH_TOKENS
-CREATE TABLE IF NOT EXISTS refresh_tokens (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  user_id BIGINT UNSIGNED NOT NULL,
-  token_hash CHAR(64) NOT NULL,
-  expires_at DATETIME NOT NULL,
-  revoked_at DATETIME NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  UNIQUE KEY uk_token_hash (token_hash),
-  KEY idx_user_id (user_id),
-  CONSTRAINT fk_refresh_user FOREIGN KEY (user_id) REFERENCES users(id)
-    ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+--
+-- Table structure for table `refresh_tokens`
+--
 
-SET FOREIGN_KEY_CHECKS = 1;
+CREATE TABLE `refresh_tokens` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `user_id` bigint(20) UNSIGNED NOT NULL,
+  `token_hash` char(64) NOT NULL,
+  `expires_at` datetime NOT NULL,
+  `revoked_at` datetime DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `reservations`
+--
+
+CREATE TABLE `reservations` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `user_id` bigint(20) UNSIGNED NOT NULL,
+  `show_id` bigint(20) UNSIGNED NOT NULL,
+  `status` enum('PENDING','CONFIRMED','CANCELLED') NOT NULL DEFAULT 'PENDING',
+  `total_amount_cents` int(10) UNSIGNED NOT NULL DEFAULT 0,
+  `payment_ref` varchar(128) DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `reservation_seats`
+--
+
+CREATE TABLE `reservation_seats` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `reservation_id` bigint(20) UNSIGNED NOT NULL,
+  `show_id` bigint(20) UNSIGNED NOT NULL,
+  `seat_id` bigint(20) UNSIGNED NOT NULL,
+  `price_cents` int(10) UNSIGNED NOT NULL DEFAULT 0,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `roles`
+--
+
+CREATE TABLE `roles` (
+  `id` tinyint(3) UNSIGNED NOT NULL,
+  `name` varchar(32) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dumping data for table `roles`
+--
+
+INSERT INTO `roles` (`id`, `name`) VALUES
+(1, 'CUSTOMER'),
+(2, 'OWNER');
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `seats`
+--
+
+CREATE TABLE `seats` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `hall_id` bigint(20) UNSIGNED NOT NULL,
+  `row_label` varchar(8) NOT NULL,
+  `seat_number` int(10) UNSIGNED NOT NULL,
+  `seat_type` enum('STANDARD','VIP','ACCESSIBLE') NOT NULL DEFAULT 'STANDARD',
+  `is_active` tinyint(1) NOT NULL DEFAULT 1,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `seat_holds`
+--
+
+CREATE TABLE `seat_holds` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `user_id` bigint(20) UNSIGNED DEFAULT NULL,
+  `show_id` bigint(20) UNSIGNED NOT NULL,
+  `seat_id` bigint(20) UNSIGNED NOT NULL,
+  `hold_token` char(64) NOT NULL,
+  `expires_at` datetime NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `shows`
+--
+
+CREATE TABLE `shows` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `hall_id` bigint(20) UNSIGNED NOT NULL,
+  `title` varchar(255) NOT NULL,
+  `starts_at` datetime NOT NULL,
+  `ends_at` datetime NOT NULL,
+  `base_price_cents` int(10) UNSIGNED NOT NULL DEFAULT 0,
+  `status` enum('SCHEDULED','CANCELLED','FINISHED') NOT NULL DEFAULT 'SCHEDULED',
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `show_seats`
+--
+
+CREATE TABLE `show_seats` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `show_id` bigint(20) UNSIGNED NOT NULL,
+  `seat_id` bigint(20) UNSIGNED NOT NULL,
+  `status` enum('FREE','HELD','RESERVED') NOT NULL DEFAULT 'FREE',
+  `price_cents` int(10) UNSIGNED NOT NULL DEFAULT 0,
+  `version` int(10) UNSIGNED NOT NULL DEFAULT 1,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `users`
+--
+
+CREATE TABLE `users` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `email` varchar(255) NOT NULL,
+  `password_hash` varchar(255) NOT NULL,
+  `is_active` tinyint(1) NOT NULL DEFAULT 1,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
+  `role_id` tinyint(3) UNSIGNED NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Indexes for dumped tables
+--
+
+--
+-- Indexes for table `cinemas`
+--
+ALTER TABLE `cinemas`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uk_owner_name` (`owner_id`,`name`),
+  ADD KEY `idx_cinemas_owner_id` (`owner_id`);
+
+--
+-- Indexes for table `halls`
+--
+ALTER TABLE `halls`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_owner_name` (`owner_id`,`name`),
+  ADD KEY `idx_owner_cinema_name` (`owner_id`,`cinema_id`,`name`),
+  ADD KEY `idx_owner` (`owner_id`),
+  ADD KEY `fk_halls_cinema` (`cinema_id`),
+  ADD KEY `idx_halls_cinema_id` (`cinema_id`,`id`);
+
+--
+-- Indexes for table `refresh_tokens`
+--
+ALTER TABLE `refresh_tokens`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uk_token_hash` (`token_hash`),
+  ADD KEY `idx_user_id` (`user_id`);
+
+--
+-- Indexes for table `reservations`
+--
+ALTER TABLE `reservations`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_res_user` (`user_id`),
+  ADD KEY `idx_res_show` (`show_id`),
+  ADD KEY `idx_res_user_created` (`user_id`,`created_at`),
+  ADD KEY `idx_res_show_created` (`show_id`,`created_at`);
+
+--
+-- Indexes for table `reservation_seats`
+--
+ALTER TABLE `reservation_seats`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uk_reserved_once` (`show_id`,`seat_id`),
+  ADD KEY `idx_reservation` (`reservation_id`),
+  ADD KEY `idx_show` (`show_id`),
+  ADD KEY `idx_seat` (`seat_id`);
+
+--
+-- Indexes for table `roles`
+--
+ALTER TABLE `roles`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `name` (`name`);
+
+--
+-- Indexes for table `seats`
+--
+ALTER TABLE `seats`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uk_hall_row_no` (`hall_id`,`row_label`,`seat_number`),
+  ADD KEY `idx_seats_hall` (`hall_id`);
+
+--
+-- Indexes for table `seat_holds`
+--
+ALTER TABLE `seat_holds`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uk_hold_token` (`hold_token`),
+  ADD UNIQUE KEY `uk_active_hold` (`show_id`,`seat_id`),
+  ADD KEY `idx_hold_expires` (`expires_at`),
+  ADD KEY `idx_hold_show` (`show_id`),
+  ADD KEY `fk_hold_user` (`user_id`),
+  ADD KEY `fk_hold_seat` (`seat_id`),
+  ADD KEY `idx_hold_show_expires` (`show_id`,`expires_at`);
+
+--
+-- Indexes for table `shows`
+--
+ALTER TABLE `shows`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_hall_time` (`hall_id`,`starts_at`),
+  ADD KEY `idx_shows_hall_ends` (`hall_id`,`ends_at`);
+
+--
+-- Indexes for table `show_seats`
+--
+ALTER TABLE `show_seats`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uk_show_seat` (`show_id`,`seat_id`),
+  ADD KEY `idx_show` (`show_id`),
+  ADD KEY `idx_seat` (`seat_id`);
+
+--
+-- Indexes for table `users`
+--
+ALTER TABLE `users`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `email` (`email`),
+  ADD KEY `fk_users_role` (`role_id`),
+  ADD KEY `idx_users_role_id` (`role_id`);
+
+--
+-- AUTO_INCREMENT for dumped tables
+--
+
+--
+-- AUTO_INCREMENT for table `cinemas`
+--
+ALTER TABLE `cinemas`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `halls`
+--
+ALTER TABLE `halls`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `refresh_tokens`
+--
+ALTER TABLE `refresh_tokens`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `reservations`
+--
+ALTER TABLE `reservations`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `reservation_seats`
+--
+ALTER TABLE `reservation_seats`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `seats`
+--
+ALTER TABLE `seats`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `seat_holds`
+--
+ALTER TABLE `seat_holds`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `shows`
+--
+ALTER TABLE `shows`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `show_seats`
+--
+ALTER TABLE `show_seats`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `users`
+--
+ALTER TABLE `users`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- Constraints for dumped tables
+--
+
+--
+-- Constraints for table `cinemas`
+--
+ALTER TABLE `cinemas`
+  ADD CONSTRAINT `fk_cinemas_owner` FOREIGN KEY (`owner_id`) REFERENCES `users` (`id`);
+
+--
+-- Constraints for table `halls`
+--
+ALTER TABLE `halls`
+  ADD CONSTRAINT `fk_halls_cinema` FOREIGN KEY (`cinema_id`) REFERENCES `cinemas` (`id`),
+  ADD CONSTRAINT `fk_halls_owner` FOREIGN KEY (`owner_id`) REFERENCES `users` (`id`);
+
+--
+-- Constraints for table `refresh_tokens`
+--
+ALTER TABLE `refresh_tokens`
+  ADD CONSTRAINT `fk_refresh_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE;
+
+--
+-- Constraints for table `reservations`
+--
+ALTER TABLE `reservations`
+  ADD CONSTRAINT `fk_res_show` FOREIGN KEY (`show_id`) REFERENCES `shows` (`id`),
+  ADD CONSTRAINT `fk_res_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`);
+
+--
+-- Constraints for table `reservation_seats`
+--
+ALTER TABLE `reservation_seats`
+  ADD CONSTRAINT `fk_resseat_reservation` FOREIGN KEY (`reservation_id`) REFERENCES `reservations` (`id`) ON DELETE CASCADE,
+  ADD CONSTRAINT `fk_resseat_seat` FOREIGN KEY (`seat_id`) REFERENCES `seats` (`id`),
+  ADD CONSTRAINT `fk_resseat_show` FOREIGN KEY (`show_id`) REFERENCES `shows` (`id`);
+
+--
+-- Constraints for table `seats`
+--
+ALTER TABLE `seats`
+  ADD CONSTRAINT `fk_seats_hall` FOREIGN KEY (`hall_id`) REFERENCES `halls` (`id`);
+
+--
+-- Constraints for table `seat_holds`
+--
+ALTER TABLE `seat_holds`
+  ADD CONSTRAINT `fk_hold_seat` FOREIGN KEY (`seat_id`) REFERENCES `seats` (`id`),
+  ADD CONSTRAINT `fk_hold_show` FOREIGN KEY (`show_id`) REFERENCES `shows` (`id`),
+  ADD CONSTRAINT `fk_hold_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE SET NULL;
+
+--
+-- Constraints for table `shows`
+--
+ALTER TABLE `shows`
+  ADD CONSTRAINT `fk_shows_hall` FOREIGN KEY (`hall_id`) REFERENCES `halls` (`id`);
+
+--
+-- Constraints for table `show_seats`
+--
+ALTER TABLE `show_seats`
+  ADD CONSTRAINT `fk_show_seats_seat` FOREIGN KEY (`seat_id`) REFERENCES `seats` (`id`),
+  ADD CONSTRAINT `fk_show_seats_show` FOREIGN KEY (`show_id`) REFERENCES `shows` (`id`) ON DELETE CASCADE;
+
+--
+-- Constraints for table `users`
+--
+ALTER TABLE `users`
+  ADD CONSTRAINT `fk_users_role` FOREIGN KEY (`role_id`) REFERENCES `roles` (`id`);
+COMMIT;
+
+/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
+/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
+/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
